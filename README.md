@@ -4,13 +4,15 @@ Spotify 桌面客户端第三方歌词插件，支持 Windows / macOS / Linux。
 
 ## 界面预览
 
-| 封面取色 · 双语歌词 | 封面模糊背景 | 深色极简背景 |
-| :---: | :---: | :---: |
-| [![封面取色与双语歌词](docs/screenshots/01-lyrics.webp)](docs/screenshots/01-lyrics.webp)<br><b>主界面·封面取色</b><br>自适应提取专辑色彩，双语歌词同步滚动，支持点击歌词随时随心跳转播放进度 | [![封面模糊背景](docs/screenshots/02-blur.webp)](docs/screenshots/02-blur.webp)<br><b>封面模糊背景</b><br>柔和毛玻璃视觉效果，随曲目封面动态流转，营造更沉浸的听歌氛围 | [![深色极简背景](docs/screenshots/03-dark.webp)](docs/screenshots/03-dark.webp)<br><b>深色极简背景</b><br>纯粹低调的暗色主题，高对比度清晰呈现歌词正文，夜间使用更加舒适护眼 |
-| **纯原文显示** | **右侧栏迷你歌词** | **手动搜索与匹配** |
-| [![纯原文显示](docs/screenshots/04-original.webp)](docs/screenshots/04-original.webp)<br><b>纯原文显示</b><br>支持一键切换隐藏翻译，专注原文歌词与排版，逐行/逐字动态高亮精准随行 | [![右侧栏迷你歌词](docs/screenshots/05-mini.webp)](docs/screenshots/05-mini.webp)<br><b>右侧栏迷你歌词</b><br>无缝嵌入侧边信息栏，浏览歌曲与主页时歌词如影随形，支持快捷折叠与关闭 | [![手动搜索与匹配](docs/screenshots/06-match.webp)](docs/screenshots/06-match.webp)<br><b>手动搜索与匹配</b><br>聚合网易云与 QQ 音乐源，按匹配度综合打分，支持歌曲链接或关键词一键直达 |
-| **歌词预览与绑定** | **显示与歌词设置** | **时间校准与网络** |
-| [![歌词预览与绑定](docs/screenshots/07-preview.webp)](docs/screenshots/07-preview.webp)<br><b>歌词预览与绑定</b><br>直观查看各候选歌词行数、时间轴与翻译，支持一键锁定绑定或本地导入导出 LRC | [![显示与歌词设置](docs/screenshots/08-settings.webp)](docs/screenshots/08-settings.webp)<br><b>显示与歌词设置</b><br>首选歌词源、逐字高亮、字号大小（小/标准/大）及背景样式自由定制 | [![时间校准与网络](docs/screenshots/09-network.webp)](docs/screenshots/09-network.webp)<br><b>时间校准与网络</b><br>支持全局与单曲毫秒级时间偏移微调，云端与纯本地模式切换，会话统计与缓存管理 |
+| 封面取色 · 双语歌词 | 封面模糊背景 |
+| :---: | :---: |
+| [![封面取色 · 双语歌词](docs/screenshots/01-lyrics.webp)](docs/screenshots/01-lyrics.webp) | [![封面模糊背景](docs/screenshots/02-blur.webp)](docs/screenshots/02-blur.webp) |
+| **深色极简背景** | **右侧栏迷你歌词** |
+| [![深色极简背景](docs/screenshots/03-dark.webp)](docs/screenshots/03-dark.webp) | [![右侧栏迷你歌词](docs/screenshots/05-mini.webp)](docs/screenshots/05-mini.webp) |
+| **手动搜索与匹配** | **候选歌词预览与绑定** |
+| [![手动搜索与匹配](docs/screenshots/06-match.webp)](docs/screenshots/06-match.webp) | [![候选歌词预览与绑定](docs/screenshots/07-preview.webp)](docs/screenshots/07-preview.webp) |
+| **显示与歌词设置** | **时间校准与网络** |
+| [![显示与歌词设置](docs/screenshots/08-settings.webp)](docs/screenshots/08-settings.webp) | [![时间校准与网络](docs/screenshots/09-network.webp)](docs/screenshots/09-network.webp) |
 
 ## 功能
 
