@@ -2,25 +2,31 @@
 /*
  * Spot-Lyric lyrics server.
  *
- * Runs the spot-lyric matching engine (src/core.js) for the Spotify client:
- * NetEase / QQ Music search, scoring, lyric download and parsing all happen here.
- * Manual matches ("使用此歌词") are stored in Cloudflare R2: one object per
- * Spotify track with the match info and the chosen lyrics; the latest choice wins.
- * The server keeps no state of its own besides a bounded memory cache.
+ * Matching runs in the Spotify client (src/core.js): NetEase / QQ Music search,
+ * scoring, lyric download and parsing all happen on the user's machine. This
+ * server only
+ *   - stores shared matches: one object per Spotify track in Cloudflare R2 with the
+ *     chosen NetEase / QQ song and its lyrics ("使用此歌词" / the upload button);
+ *     the latest upload wins;
+ *   - relays provider requests verbatim for clients whose renderer cannot reach
+ *     NetEase / QQ directly (CORS). Only an allow-list of hosts and API paths is
+ *     forwarded and nothing is interpreted (RELAY=0 turns this off).
+ * Besides a bounded memory cache the server keeps no state of its own.
  */
 const nodeHttp = require('node:http');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const core = require(process.env.SPOT_LYRIC_CORE || path.join(__dirname, '../../src/core.js'));
-const { MemoryCache, DirBucket, BindingStore, EngineStore } = require('./store');
+const { MemoryCache, DirBucket, BindingStore } = require('./store');
 const { S3Bucket } = require('./r2');
-const { createTransport } = require('./upstream');
+const { createTransport, relayAllowed } = require('./upstream');
 
 const VERSION = (() => {
   try { return fs.readFileSync(path.join(__dirname, '../../VERSION'), 'utf8').trim(); } catch (_) { return '0.0.0'; }
 })();
-const MAX_BODY = 512 * 1024;
+/* Word-timed lyrics with translations stay well below this. */
+const MAX_BODY = 2 * 1024 * 1024;
 const NAMES = core.PROVIDER_NAMES;
 
 function config(env) {
@@ -32,13 +38,14 @@ function config(env) {
     origins: new Set((env.ALLOWED_ORIGINS || 'https://xpui.app.spotify.com').split(',').map(s => s.trim()).filter(Boolean)),
     token: env.API_TOKEN || '',
     trustProxy: env.TRUST_PROXY !== '0',
+    relay: env.RELAY !== '0',
     neteaseRealIp: env.NETEASE_REAL_IP === undefined ? '211.161.244.70' : env.NETEASE_REAL_IP,
     qqGapMs: int(env.QQ_MIN_INTERVAL_MS, 400),
     neteaseGapMs: int(env.NETEASE_MIN_INTERVAL_MS, 120),
     cacheBytes: int(env.CACHE_MB, 64) * 1024 * 1024,
     readLimit: int(env.RATE_LIMIT, 240),
     writeLimit: int(env.WRITE_RATE_LIMIT, 30),
-    matchTimeoutMs: int(env.MATCH_TIMEOUT_MS, 30000),
+    relayLimit: int(env.RELAY_RATE_LIMIT, 120),
     r2Prefix: env.R2_PREFIX === undefined ? 'lyrics/' : env.R2_PREFIX,
     logRequests: env.LOG_REQUESTS !== '0',
   };
@@ -75,33 +82,18 @@ function cleanTrack(input) {
   if (!track.title.trim()) throw new HttpError(400, 'track.title required');
   return track;
 }
-function cleanSettings(input) {
-  const s = input && typeof input === 'object' ? input : {};
-  return {
-    preferred_provider: core.PROVIDERS.includes(s.preferred_provider) ? s.preferred_provider : 'netease',
-    spotify_first: s.spotify_first === true, loose_match: s.loose_match === true, verify_lyrics: s.verify_lyrics !== false,
-  };
-}
-/* Spotify's lyrics as sent by the client (line text only). */
-function cleanReference(input) {
-  if (input === undefined) return core.DEFER;
-  if (!input || input === 'none' || typeof input !== 'object' || !Array.isArray(input.lines)) return null;
-  const lines = input.lines.slice(0, 400).map((l, i) => {
-    const start = l && Number.isFinite(l.start_time_ms) ? Math.trunc(l.start_time_ms) : i * 1000;
-    return { text: str(l && l.text, 300), start_time_ms: start, end_time_ms: start, words: [] };
-  });
-  const sync = ['word', 'line', 'unsynced'].includes(input.sync_type) ? input.sync_type : 'line';
-  return { source: 'spotify', provider: 'spotify', sync_type: sync, lines };
-}
+/* The provider song the lyrics came from; optional (local LRC files have none). */
 function cleanCandidate(input) {
+  if (input == null) return null;
   const candidate = core.candidateFromJson(input);
-  if (!candidate) throw new HttpError(400, 'candidate required');
+  if (!candidate) throw new HttpError(400, 'bad candidate');
   candidate.id = candidate.id.slice(0, 64); candidate.mid = (candidate.mid || '').slice(0, 64);
   if (!/^\d{1,20}$/.test(candidate.id)) throw new HttpError(400, 'bad candidate id');
   return candidate;
 }
-const failedStatus = status => /^(请求失败|来源暂不可用)/.test(status || '');
 const providerUrl = c => c.provider === 'qq' ? (c.mid ? `https://y.qq.com/n/ryqq/songDetail/${c.mid}` : '') : `https://music.163.com/#/song?id=${c.id}`;
+/* What GET /api/bindings returns: everything but the LRC copy (kept in the object for people reading the bucket). */
+const publicDoc = doc => { const { lrc: _lrc, ...rest } = doc; return rest; };
 
 /* ------------------------------------------------------------- app ------- */
 function createApp(options = {}) {
@@ -112,13 +104,11 @@ function createApp(options = {}) {
   const bucket = options.bucket || S3Bucket.fromEnv(env) || new DirBucket(path.join(cfg.dataDir, 'objects'));
   const storage = bucket.local ? 'local' : 'r2';
   const bindings = new BindingStore(bucket, cache, cfg.r2Prefix);
-  const http = new core.Http(options.transport || createTransport({ neteaseRealIp: cfg.neteaseRealIp, qqGapMs: cfg.qqGapMs, neteaseGapMs: cfg.neteaseGapMs }));
-  const store = new EngineStore(cache, bindings, core);
-  const readLimiter = new RateLimiter(cfg.readLimit), writeLimiter = new RateLimiter(cfg.writeLimit);
+  const upstream = options.transport || createTransport({ neteaseRealIp: cfg.neteaseRealIp, qqGapMs: cfg.qqGapMs, neteaseGapMs: cfg.neteaseGapMs });
+  const readLimiter = new RateLimiter(cfg.readLimit), writeLimiter = new RateLimiter(cfg.writeLimit), relayLimiter = new RateLimiter(cfg.relayLimit);
   const locks = new Map();
-  const engine = (settings, spotify) => new core.Engine({ store, http, settings: () => settings, spotify: spotify || null });
 
-  /* One bind / unbind at a time per track, so the last click is also the last write. */
+  /* One write at a time per track, so the last click is also the last write. */
   function serialize(id, task) {
     const previous = locks.get(id) || Promise.resolve();
     const next = previous.catch(() => {}).then(task);
@@ -127,79 +117,39 @@ function createApp(options = {}) {
     tail.then(() => { if (locks.get(id) === tail) locks.delete(id); });
     return next;
   }
-
-  async function storedBinding(id) {
-    try { return await bindings.get(id); }
-    catch (e) { console.error('[storage] get', id, e.message); return null; }
-  }
-
-  async function match(body, signal) {
-    const track = cleanTrack(body.track);
-    const settings = cleanSettings(body.settings);
-    const reference = cleanReference(body.spotify);
-    const id = core.spotifyId(track.uri);
-    if (id && !body.force) {
-      /* The lyrics the user chose are served straight from R2. */
-      const doc = await storedBinding(id);
-      /* Lyrics stored by an older parser (e.g. misplaced translations) are re-fetched from the bound source. */
-      if (doc && doc.match && core.lyricsUsable(doc.lyrics) && doc.lyrics.parser !== core.PARSER_VERSION) {
-        try { const fresh = await bind({ track: body.track, candidate: doc.match }); if (core.lyricsUsable(fresh.lyrics)) return { status: fresh.status, lyrics: fresh.lyrics, manual: true }; }
-        catch (err) { console.error('[refresh]', id, err.message); }
-      }
-      if (doc && doc.match && core.lyricsUsable(doc.lyrics)) return { status: `已绑定歌词 · ${NAMES[doc.match.provider] || doc.match.provider}`, lyrics: doc.lyrics, manual: true };
-    }
-    const spotify = async () => reference === core.DEFER ? core.DEFER : reference ? { lyrics: reference, colors: null } : null;
-    const e = engine(settings, spotify);
-    const timer = setTimeout(() => e.controller && e.controller.abort(), cfg.matchTimeoutMs);
-    const onAbort = () => e.controller && e.controller.abort();
-    signal.addEventListener('abort', onAbort);
-    try { await e.setTrack(track, !!body.force); } finally { clearTimeout(timer); signal.removeEventListener('abort', onAbort); }
-    if (e.busy) throw new HttpError(504, '匹配超时，请稍后重试');
-    if (e.deferred) return { status: e.status, need_spotify: true, verifiable: e.deferred.verifiable, failed: e.deferred.failed };
-    if (e.lyrics && e.lyrics.source === 'spotify') return { status: e.status, use_spotify: true };
-    const usable = core.lyricsUsable(e.lyrics);
-    return { status: e.status, lyrics: usable ? e.lyrics : null, manual: /^已绑定/.test(e.status), failed: !usable && failedStatus(e.status) };
-  }
-
-  async function search(body) {
-    const query = str(body.query, 2048).trim();
-    if (!query) throw new HttpError(400, 'query required');
-    const e = engine(cleanSettings(body.settings));
-    try { e.track = body.track ? cleanTrack(body.track) : null; } catch (_) { e.track = null; }
-    const result = await e.search(query);
-    return { providers: result.providers };
-  }
-
-  async function lyrics(body) {
-    const candidate = cleanCandidate(body.candidate);
-    try { return { lyrics: await engine(cleanSettings(null)).preview(candidate) }; }
-    catch (err) { throw new HttpError(502, err.message || String(err)); }
-  }
-
-  async function bind(body) {
-    const track = cleanTrack(body.track);
-    const candidate = cleanCandidate(body.candidate);
+  function trackId(track) {
     const id = core.spotifyId(track.uri);
     if (!id) throw new HttpError(400, '只有 Spotify 曲目可以保存到服务器');
-    /* Lyrics are always downloaded by the server: the client cannot inject text. */
-    let lyrics;
-    try { lyrics = await engine(cleanSettings(null)).providerFetch(candidate, null, { remaining: 2 }); }
-    catch (err) { throw new HttpError(502, err.message || String(err)); }
-    if (!core.lyricsUsable(lyrics)) throw new HttpError(422, '这个结果没有歌词');
-    lyrics = { ...lyrics, track_uri: `spotify:track:${id}`, track_id: id };
+    return id;
+  }
+
+  /* "使用此歌词" or the upload button: the lyrics come from the client. */
+  async function bind(body) {
+    const track = cleanTrack(body.track);
+    const id = trackId(track);
+    const candidate = cleanCandidate(body.candidate);
+    const lyrics = core.sanitizeLyrics(body.lyrics);
+    if (!lyrics) throw new HttpError(422, '没有可保存的歌词');
+    /* Spotify's own (licensed) lyrics are never redistributed. */
+    if (lyrics.source === 'spotify') throw new HttpError(422, 'Spotify 官方歌词不能上传');
+    if (candidate && lyrics.source !== candidate.provider) throw new HttpError(400, '歌词来源与匹配结果不一致');
+    lyrics.track_uri = `spotify:track:${id}`; lyrics.track_id = id;
     const spotifyUrl = `https://open.spotify.com/track/${id}`;
     return serialize(id, async () => {
       const now = new Date().toISOString();
-      const previous = await storedBinding(id);
+      let previous = null;
+      try { previous = await bindings.get(id); } catch (err) { console.error('[storage] get', id, err.message); }
       const lrc = core.exportLrc(lyrics);
       /* One object per Spotify track: link + match info + lyrics. */
       const doc = {
         spotify_url: spotifyUrl,
         spotify_uri: `spotify:track:${id}`,
         track: { title: track.title, artists: track.artists, album: track.album, duration_ms: track.duration_ms },
-        match: { ...core.candidateJson(candidate), provider_name: NAMES[candidate.provider], url: providerUrl(candidate) },
+        match: candidate ? { ...core.candidateJson(candidate), provider_name: NAMES[candidate.provider], url: providerUrl(candidate) } : null,
+        source: lyrics.source,
         sync_type: lyrics.sync_type,
         line_count: lyrics.lines.length,
+        translated: lyrics.lines.some(l => l.translated_text),
         lyrics_sha256: crypto.createHash('sha256').update(lrc).digest('hex'),
         bind_count: ((previous && previous.bind_count) || 0) + 1,
         created_at: (previous && previous.created_at) || now,
@@ -208,33 +158,49 @@ function createApp(options = {}) {
         lyrics,
       };
       try {
-        await bindings.save(id, doc, { 'spotify-url': spotifyUrl, provider: candidate.provider, 'provider-id': candidate.id });
+        const metadata = { 'spotify-url': spotifyUrl, source: lyrics.source };
+        if (candidate) { metadata.provider = candidate.provider; metadata['provider-id'] = candidate.id; }
+        await bindings.save(id, doc, metadata);
       } catch (err) {
         console.error('[storage] put', id, err.message);
-        throw new HttpError(502, `保存到 R2 失败：${err.message}`);
+        throw new HttpError(502, `保存到 ${storage === 'r2' ? 'R2' : '存储'}失败：${err.message}`);
       }
-      return { status: `已绑定歌词 · ${NAMES[candidate.provider]}`, lyrics, stored: storage, updated_at: now };
+      return { stored: storage, updated_at: now, binding: publicDoc(doc) };
     });
   }
 
   async function unbind(body) {
-    const track = cleanTrack(body.track);
-    const id = core.spotifyId(track.uri);
-    if (!id) throw new HttpError(400, '只有 Spotify 曲目保存在服务器');
+    const id = trackId(cleanTrack(body.track));
     return serialize(id, async () => {
       try { await bindings.remove(id); }
-      catch (err) { console.error('[storage] delete', id, err.message); throw new HttpError(502, `从 R2 删除失败：${err.message}`); }
+      catch (err) { console.error('[storage] delete', id, err.message); throw new HttpError(502, `从存储删除失败：${err.message}`); }
       return { removed: true };
     });
   }
 
-  /* Match info for one track (lyrics as LRC only, to keep it small). */
+  /* The stored match and lyrics for one Spotify track. */
   async function binding(id) {
     let doc;
     try { doc = await bindings.get(id); } catch (err) { throw new HttpError(502, err.message); }
     if (!doc) throw new HttpError(404, 'not bound');
-    const { lyrics: _lyrics, ...rest } = doc;
-    return { binding: rest };
+    return { binding: publicDoc(doc) };
+  }
+
+  /* Forwards one provider request built by the client (allow-listed, not interpreted). */
+  async function relay(body) {
+    if (!cfg.relay) throw new HttpError(403, '此服务器未开启转发');
+    const method = String(body.method || 'GET').toUpperCase();
+    const url = str(body.url, 4096);
+    if (!relayAllowed(method, url)) throw new HttpError(400, '不允许转发这个地址');
+    const headers = {};
+    if (body.headers && typeof body.headers === 'object') {
+      for (const [name, value] of Object.entries(body.headers).slice(0, 10)) if (typeof value === 'string') headers[name] = value.slice(0, 500);
+    }
+    const payload = body.body == null ? null : str(body.body, 64 * 1024);
+    let response;
+    try { response = await upstream({ method, url, headers, body: payload }); }
+    catch (err) { throw new HttpError(502, `转发失败：${err.message}`); }
+    return { status: response.status, body: response.body, retry_after: response.retryAfter || null };
   }
 
   /* ------------------------------------------------------------ http ---- */
@@ -275,41 +241,44 @@ function createApp(options = {}) {
     res.end(JSON.stringify(payload));
   }
 
-  const routes = { '/api/match': match, '/api/search': search, '/api/lyrics': lyrics, '/api/bind': bind, '/api/unbind': unbind };
+  const routes = { '/api/bind': bind, '/api/unbind': unbind, '/api/relay': relay };
   const writes = new Set(['/api/bind', '/api/unbind']);
+  /* Matching moved to the client in v1.2: tell old clients to update. */
+  const retired = new Set(['/api/match', '/api/search', '/api/lyrics']);
 
   async function handle(req, res) {
     const started = Date.now();
     let status = 500;
     const url = new URL(req.url, 'http://localhost');
     const send = (code, payload) => { status = code; respond(req, res, code, payload); };
-    const controller = new AbortController();
-    res.on('close', () => { if (!res.writableFinished) controller.abort(); });
     try {
       const origin = req.headers.origin;
       if (origin && !cfg.origins.has('*') && !cfg.origins.has(origin)) throw new HttpError(403, 'origin not allowed');
       if (req.method === 'OPTIONS') return send(204, null);
       if ((req.method === 'GET' || req.method === 'HEAD') && url.pathname === '/health') {
-        return send(200, { ok: true, version: VERSION, storage, auth: !!cfg.token });
+        return send(200, { ok: true, version: VERSION, storage, auth: !!cfg.token, relay: cfg.relay });
       }
       if (req.method === 'GET' && url.pathname === '/') {
-        return send(200, { name: 'spot-lyric-server', version: VERSION, docs: 'POST /api/match | /api/search | /api/lyrics | /api/bind | /api/unbind, GET /api/bindings/<spotify-track-id>' });
+        return send(200, { name: 'spot-lyric-server', version: VERSION, docs: 'GET /api/bindings/<spotify-track-id> | POST /api/bind | /api/unbind | /api/relay' });
       }
       if (!url.pathname.startsWith('/api/')) throw new HttpError(404, 'not found');
       if (cfg.token) {
         const given = Buffer.from(String(req.headers.authorization || '')), wanted = Buffer.from(`Bearer ${cfg.token}`);
         if (given.length !== wanted.length || !crypto.timingSafeEqual(given, wanted)) throw new HttpError(401, '需要歌词服务器令牌');
       }
+      if (retired.has(url.pathname)) throw new HttpError(410, '客户端版本过旧：请重新运行 patch 脚本更新 Spot-Lyric');
       const address = clientAddress(req);
-      const write = writes.has(url.pathname);
-      if (!readLimiter.allow(address) || (write && !writeLimiter.allow(address))) throw new HttpError(429, '请求过于频繁，请稍后再试');
+      const write = writes.has(url.pathname), relaying = url.pathname === '/api/relay';
+      if (!readLimiter.allow(address) || (write && !writeLimiter.allow(address)) || (relaying && !relayLimiter.allow(address))) {
+        throw new HttpError(429, '请求过于频繁，请稍后再试');
+      }
       const bindingMatch = /^\/api\/bindings\/([A-Za-z0-9]{22})$/.exec(url.pathname);
       if (req.method === 'GET' && bindingMatch) return send(200, await binding(bindingMatch[1]));
       const route = routes[url.pathname];
       if (!route) throw new HttpError(404, 'not found');
       if (req.method !== 'POST') throw new HttpError(405, 'method not allowed');
       const body = await readBody(req);
-      return send(200, await route(body, controller.signal));
+      return send(200, await route(body));
     } catch (err) {
       if (err instanceof HttpError) return send(err.status, { error: err.message });
       console.error('[server]', req.method, url.pathname, err);
@@ -333,7 +302,7 @@ function createApp(options = {}) {
 if (require.main === module) {
   const app = createApp();
   app.listen().then(address => {
-    console.log(`spot-lyric-server v${VERSION} listening on ${address.address}:${address.port} · storage: ${app.storage === 'r2' ? 'R2' : 'local directory (no R2 configured)'}`);
+    console.log(`spot-lyric-server v${VERSION} listening on ${address.address}:${address.port} · storage: ${app.storage === 'r2' ? 'R2' : 'local directory (no R2 configured)'} · relay: ${app.config.relay ? 'on' : 'off'}`);
   });
   const stop = () => { app.close().then(() => process.exit(0)); setTimeout(() => process.exit(0), 5000).unref(); };
   process.on('SIGTERM', stop);

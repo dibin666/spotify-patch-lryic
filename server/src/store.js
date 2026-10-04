@@ -4,8 +4,8 @@
  *
  * Everything persistent lives in object storage (Cloudflare R2): one JSON object
  * per Spotify track holding the Spotify link, the chosen NetEase / QQ song (match
- * info) and its lyrics. The latest "使用此歌词" overwrites the object. The server
- * keeps only a bounded in-memory cache.
+ * info) and its lyrics. The latest "使用此歌词" / upload overwrites the object.
+ * The server keeps only a bounded in-memory cache of those objects.
  */
 const fs = require('node:fs');
 const path = require('node:path');
@@ -92,37 +92,4 @@ class BindingStore {
   }
 }
 
-/* -------------------------------------------------- engine store adapter --- */
-/* The matching engine (src/core.js) talks to a "store". On the server provider
- * responses go to the shared memory cache; per-track results are not cached
- * (they depend on each client's settings); manual bindings come from R2. */
-class EngineStore {
-  constructor(cache, bindings, core) { this.cache = cache; this.bindings = bindings; this.core = core; }
-  get(_key, fallback) { return fallback; }
-  getInt(_key, fallback) { return fallback; }
-  set() {}
-  static transient(key) { return key.startsWith('tracklyrics') || key.startsWith('negative:'); }
-  async cacheGet(key) { if (EngineStore.transient(key)) return null; const v = this.cache.get(`p:${key}`); return v === undefined ? null : v; }
-  async cachePut(key, value, ttl) {
-    if (EngineStore.transient(key)) return;
-    /* A provider failure pauses that provider for every user here: keep it short. */
-    if (key.startsWith('failure:')) ttl = Math.min(ttl || 20, 20);
-    this.cache.set(`p:${key}`, value, ttl || undefined);
-  }
-  async cacheRemove(key) { this.cache.delete(`p:${key}`); }
-  async cacheClear() {}
-  async kvGet() { return null; }
-  async kvSet() {}
-  async matchGet(track) {
-    const id = this.core.spotifyId(track && track.uri);
-    let doc = null;
-    if (id) { try { doc = await this.bindings.get(id); } catch (e) { console.error('[storage] get', id, e.message); } }
-    const candidate = doc ? this.core.candidateFromJson(doc.match) : null;
-    return { candidate, manual: !!candidate };
-  }
-  /* Automatic / lyric-verified matches are not stored: only "使用此歌词" (POST /api/bind). */
-  async matchSave() {}
-  async matchRemove() {}
-}
-
-module.exports = { MemoryCache, DirBucket, BindingStore, EngineStore };
+module.exports = { MemoryCache, DirBucket, BindingStore };

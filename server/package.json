@@ -1,8 +1,8 @@
 {
   "name": "spot-lyric-server",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "private": true,
-  "description": "Lyrics server for Spot-Lyric for Spotify: NetEase / QQ Music search and matching, manual matches stored in Cloudflare R2",
+  "description": "Lyrics server for Spot-Lyric for Spotify: shared matches and lyrics stored in Cloudflare R2, allow-listed relay of NetEase / QQ Music requests (matching runs in the client)",
   "license": "MIT",
   "main": "src/server.js",
   "engines": { "node": ">=20" },

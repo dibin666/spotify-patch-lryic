@@ -45,6 +45,8 @@
     minus: '<path d="M2 7.25h12v1.5H2z"/>',
     plus: '<path d="M7.25 2v5.25H2v1.5h5.25V14h1.5V8.75H14v-1.5H8.75V2z"/>',
     note: '<path d="M10 1.5v8.27A2.5 2.5 0 1 0 11.5 12V4.6l3-.86V1.95l-4.5 1.3z"/>',
+    upload: '<path d="M8 1.94 12.03 6l-1.06 1.06-2.22-2.22v6.41h-1.5V4.84L5.03 7.06 3.97 6z"/><path d="M2 10.5h1.5v2h9v-2H14V14H2z"/>',
+    uploaded: '<path d="M13.53 3.47a.75.75 0 0 1 0 1.06L6.5 11.56 2.47 7.53a.75.75 0 1 1 1.06-1.06L6.5 9.44l5.97-5.97a.75.75 0 0 1 1.06 0"/><path d="M2 12.5h12V14H2z"/>',
   };
 
   /* ------------------------------------------------------- platform ----- */
@@ -81,7 +83,7 @@
   /* ---------------------------------------------------------- store ----- */
   const SETTINGS_KEY = 'spot-lyric:settings';
   const DEFAULTS = {
-    preferred_provider: 'netease', spotify_first: false, prefetch: true, loose_match: false, verify_lyrics: true,
+    preferred_provider: 'netease', spotify_first: false, prefetch: true, verify_lyrics: true, relay: true,
     translation: true, word_sync: true, font_scale: 1, color_mode: 'cover', only_eligible: false,
     server_url: '', server_token: '',
   };
@@ -169,7 +171,7 @@
   }
 
   /* ---------------------------------------------------- network ----- */
-  const serverState = { ok: null, version: '', storage: '', error: '', checked: 0 };
+  const serverState = { ok: null, version: '', storage: '', relay: null, error: '', checked: 0 };
   let serverConfig = () => ({ url: cleanServerUrl(DEFAULT_SERVER), token: '' });
   const withTimeout = (signal, ms) => {
     const timeout = AbortSignal.timeout ? AbortSignal.timeout(ms) : null;
@@ -181,19 +183,21 @@
     try {
       const r = await fetch(url + '/health', { cache: 'no-store', signal: withTimeout(null, 8000) });
       const data = await r.json();
-      serverState.ok = !!data.ok; serverState.version = data.version || ''; serverState.storage = data.storage || ''; serverState.error = '';
+      serverState.ok = !!data.ok; serverState.version = data.version || ''; serverState.storage = data.storage || '';
+      serverState.relay = data.relay !== false; serverState.error = '';
     } catch (e) { serverState.ok = false; serverState.error = e.message || String(e); }
     serverState.checked = Date.now();
     return serverState.ok;
   }
-  async function serverTransport(path, body, signal) {
+  async function serverTransport(method, path, body, signal) {
     const { url, token } = serverConfig();
     /* text/plain keeps this a "simple" CORS request: no preflight round-trip. */
-    const headers = { 'Content-Type': 'text/plain' };
+    const headers = {};
+    if (body != null) headers['Content-Type'] = 'text/plain';
     if (token) headers.Authorization = 'Bearer ' + token;
     let response;
     try {
-      response = await fetch(url + path, { method: 'POST', headers, body, signal: withTimeout(signal, 45000), cache: 'no-store' });
+      response = await fetch(url + path, { method, headers, body: body == null ? undefined : body, signal: withTimeout(signal, 30000), cache: 'no-store' });
     } catch (e) {
       if (signal && signal.aborted) throw new Core.ProviderError('请求已取消', 'cancelled');
       serverState.ok = false;
@@ -201,6 +205,44 @@
     }
     serverState.ok = true;
     return { status: response.status, body: await response.text() };
+  }
+  const cloud = new Core.Cloud(serverTransport);
+
+  /* NetEase / QQ requests run on this machine. The Spotify renderer enforces CORS
+   * and neither service sends CORS headers, so a direct request only works when
+   * Spotify was started with --disable-web-security (patch.sh --direct). Otherwise
+   * the lyrics server relays the request it is given (allow-listed, no logic). */
+  const netState = { direct: null, checked: 0, relayed: 0, directCount: 0 };
+  const FORBIDDEN_HEADERS = /^(referer|user-agent|cookie|origin|host|connection|content-length)$/i;
+  async function directFetch(req, signal) {
+    const headers = {};
+    for (const [name, value] of Object.entries(req.headers || {})) if (!FORBIDDEN_HEADERS.test(name)) headers[name] = value;
+    const response = await fetch(req.url, {
+      method: req.method || 'GET', headers, body: req.body == null ? undefined : req.body, credentials: 'omit',
+      referrerPolicy: 'no-referrer', cache: 'no-store', redirect: 'error', signal: withTimeout(signal, 12000),
+    });
+    return { status: response.status, body: await response.text(), retryAfter: response.headers.get('retry-after') };
+  }
+  let relayAllowed = () => true;
+  async function providerTransport(req, signal) {
+    /* A blocked direct attempt is re-probed every 10 minutes (e.g. after a restart with the flag). */
+    if (netState.direct !== false || Date.now() - netState.checked > 600000) {
+      try {
+        const response = await directFetch(req, signal);
+        netState.direct = true; netState.checked = Date.now(); netState.directCount++;
+        return response;
+      } catch (e) {
+        if (signal && signal.aborted) throw new Core.ProviderError('请求已取消', 'cancelled');
+        /* Once direct requests worked, a failure is a real network error, not CORS. */
+        if (netState.direct === true) { const error = new Core.ProviderError('网络错误：' + (e.message || e), 'network'); error.transient = true; throw error; }
+        if (netState.direct !== false) log('direct NetEase / QQ requests are blocked (CORS); using the lyrics server relay');
+        netState.direct = false; netState.checked = Date.now();
+      }
+    }
+    if (!relayAllowed()) throw new Core.ProviderError('本机无法直连网易云 / QQ 音乐（已关闭服务器转发）', 'network');
+    if (serverState.relay === false) throw new Core.ProviderError('本机无法直连，且歌词服务器未开启转发', 'network');
+    netState.relayed++;
+    return cloud.relay(req, signal);
   }
 
   /* ---------------------------------------------------- application ----- */
@@ -215,8 +257,9 @@
       this.open = false; this.ignoreNav = 0;
       this.pendingTrack = undefined;
       this.colorCache = new Map();
-      this.engine = new Core.RemoteEngine({
-        store: this.store, transport: serverTransport,
+      relayAllowed = () => this.store.setting('relay') !== false;
+      this.engine = new Core.Engine({
+        store: this.store, http: new Core.Http(providerTransport), cloud,
         settings: () => this.store.settings(),
         spotify: (track, signal) => this.spotifyLyrics(track, signal),
         onChange: () => this.onEngine(),
@@ -362,8 +405,7 @@
     }
   }
 
-  /* Picks a vivid representative colour and maps it into the band Spotify uses
-   * for lyrics backgrounds: black upcoming lines and white active lines stay legible. */
+  /* Picks the representative colour of a cover as [hue, saturation, lightness]. */
   function dominantColor(data) {
     const buckets = new Map();
     for (let i = 0; i < data.length; i += 4) {
@@ -381,11 +423,28 @@
     let best = null;
     for (const bucket of buckets.values()) if (!best || bucket.w > best.w) best = bucket;
     if (!best) return null;
-    let [hue, s, l] = rgbToHsl(best.r / best.w, best.g / best.w, best.b / best.w);
-    s = s < 0.08 ? s : clamp(s, 0.32, 0.72);
-    l = clamp(l, 0.3, 0.44);
-    return hslToCss(hue, s, l);
+    return rgbToHsl(best.r / best.w, best.g / best.w, best.b / best.w);
   }
+  /* A muted, darker version of a colour: a calm backdrop for long reading. Lines use
+   * light tints of the same hue instead of black / white on a saturated field. */
+  function softPalette([hue, s, l]) {
+    const sat = s < 0.08 ? s : clamp(s * 0.5, 0.12, 0.34);
+    const light = clamp(l * 0.75, 0.17, 0.27);
+    return {
+      background: hslToCss(hue, sat, light),
+      inactive: `hsl(${hue.toFixed(1)} ${(Math.min(sat, 0.3) * 100).toFixed(1)}% 86% / .5)`,
+      active: 'rgb(255,255,255)',
+    };
+  }
+  function cssToHsl(css) {
+    const m = /rgba?\((\d+)[,\s]+(\d+)[,\s]+(\d+)/.exec(css || '');
+    return m ? rgbToHsl(+m[1], +m[2], +m[3]) : null;
+  }
+  const BACKGROUNDS = {
+    dark: { background: '#121212', inactive: 'rgba(255,255,255,.45)', active: '#fff' },
+    blur: { background: 'rgb(24,24,24)', inactive: 'rgba(255,255,255,.5)', active: '#fff' },
+    neutral: { background: 'hsl(0 0% 22%)', inactive: 'rgba(255,255,255,.5)', active: '#fff' },
+  };
   function rgbToHsl(r, g, b) {
     r /= 255; g /= 255; b /= 255;
     const max = Math.max(r, g, b), min = Math.min(r, g, b), l = (max + min) / 2;
@@ -403,12 +462,22 @@
   class EntryButton {
     constructor(app) {
       this.app = app;
+      this.uploading = false;
+      const hover = (button, text) => ({
+        onmouseenter: () => this.tooltip(button(), text()), onmouseleave: () => this.tooltip(null),
+        onfocus: () => this.tooltip(button(), text()), onblur: () => this.tooltip(null),
+      });
       this.button = h('button', {
         type: 'button', 'data-testid': 'spot-lyric-button', 'aria-label': '第三方歌词', 'aria-pressed': 'false',
-        class: 'sl-entry', onclick: () => app.toggle(),
-        onmouseenter: () => this.tooltip(true), onmouseleave: () => this.tooltip(false), onfocus: () => this.tooltip(true), onblur: () => this.tooltip(false),
+        class: 'sl-entry', onclick: () => app.toggle(), ...hover(() => this.button, () => '第三方歌词'),
       }, h('span', { class: 'sl-entry-icon', 'aria-hidden': 'true' }, svg(ICON.lyrics)));
-      this.tip = h('div', { class: 'sl-tooltip', role: 'tooltip' }, '第三方歌词');
+      /* Small companion button: uploads the lyrics on screen to the lyrics server. */
+      this.uploadIcon = h('span', { class: 'sl-upload-icon', 'aria-hidden': 'true' }, svg(ICON.upload, 14));
+      this.uploadButton = h('button', {
+        type: 'button', 'data-testid': 'spot-lyric-upload', 'aria-label': '上传当前歌词到服务器', class: 'sl-upload',
+        onclick: () => this.upload(), ...hover(() => this.uploadButton, () => this.uploadHint()),
+      }, this.uploadIcon);
+      this.tip = h('div', { class: 'sl-tooltip', role: 'tooltip' });
       this.attach();
       /* React re-renders the now-playing bar; re-attach whenever we are dropped.
        * Checks are coalesced so heavy DOM churn costs at most one query per 250 ms. */
@@ -421,7 +490,7 @@
     }
     inPlace() {
       const official = document.querySelector('[data-testid="lyrics-button"]');
-      return !official || this.button.nextElementSibling === official;
+      return (!official || this.button.nextElementSibling === official) && this.uploadButton.nextElementSibling === this.button;
     }
     attach() {
       /* Insert as a direct sibling of the official lyrics button so it shares the
@@ -435,6 +504,7 @@
         if (!anchor) return;
         anchor.before(this.button);
       }
+      this.button.before(this.uploadButton);
       this.refresh();
     }
     refresh() {
@@ -443,11 +513,42 @@
       this.button.setAttribute('aria-pressed', String(active));
       const lyrics = this.app.engine.lyrics;
       this.button.dataset.has = String(Core.lyricsUsable(lyrics));
+      const blocked = !!this.uploadBlocked(), saved = !blocked && this.app.engine.origin === 'cloud';
+      this.uploadButton.dataset.state = this.uploading ? 'busy' : blocked ? 'off' : saved ? 'saved' : 'ready';
+      this.uploadButton.setAttribute('aria-disabled', String(blocked));
+      if (this.uploadIconState !== saved) { this.uploadIconState = saved; this.uploadIcon.replaceChildren(svg(saved ? ICON.uploaded : ICON.upload, 14)); }
+      if (this.tipOwner === this.uploadButton) this.tooltip(this.uploadButton, this.uploadHint());
     }
-    tooltip(show) {
-      if (!show) { this.tip.remove(); return; }
+    uploadBlocked() {
+      const engine = this.app.engine, lyrics = engine.lyrics, track = engine.track;
+      if (!track) return '没有正在播放的歌曲';
+      if (!Core.lyricsUsable(lyrics)) return engine.busy ? '正在匹配歌词…' : '当前歌曲没有可上传的歌词';
+      if (lyrics.source === 'spotify') return 'Spotify 官方歌词不上传到服务器';
+      if (!Core.spotifyId(track.uri)) return '本地文件无法上传到服务器';
+      return '';
+    }
+    uploadHint() {
+      if (this.uploading) return '正在上传…';
+      const blocked = this.uploadBlocked();
+      if (blocked) return blocked;
+      const engine = this.app.engine, source = NAMES[engine.lyrics.source] || engine.lyrics.source;
+      return engine.origin === 'cloud' ? `当前歌词已保存在服务器（${source}），点击重新上传` : `上传当前歌词到服务器（${source}）`;
+    }
+    async upload() {
+      if (this.uploading) return;
+      const blocked = this.uploadBlocked();
+      if (blocked) { toast(blocked); return; }
+      this.uploading = true; this.refresh();
+      try { await this.app.engine.upload(); toast('已上传当前歌词到歌词服务器'); }
+      catch (e) { toast('上传失败：' + (e.message || e)); }
+      finally { this.uploading = false; this.refresh(); }
+    }
+    tooltip(owner, text) {
+      this.tipOwner = owner;
+      if (!owner) { this.tip.remove(); return; }
+      this.tip.textContent = text;
       document.body.append(this.tip);
-      const r = this.button.getBoundingClientRect(), t = this.tip.getBoundingClientRect();
+      const r = owner.getBoundingClientRect(), t = this.tip.getBoundingClientRect();
       this.tip.style.left = `${Math.round(clamp(r.left + r.width / 2 - t.width / 2, 8, innerWidth - t.width - 8))}px`;
       this.tip.style.top = `${Math.round(r.top - t.height - 8)}px`;
     }
@@ -484,8 +585,9 @@
       this.stateBox = h('div', { class: 'sl-state' });
       this.scroller = h('div', { class: 'sl-scroll' }, this.wrap, this.controls);
       this.syncBtn = h('button', { type: 'button', class: 'sl-sync', onclick: () => this.follow(true) }, svg(ICON.sync), h('span', null, '同步'));
+      this.bg = h('div', { class: 'sl-bg' });
       this.page = h('div', { class: 'sl-page', 'data-testid': 'spot-lyric-page', tabindex: '-1' },
-        h('div', { class: 'sl-bg' }), this.scroller, this.stateBox, this.syncBtn);
+        this.bg, this.scroller, this.stateBox, this.syncBtn);
 
       const userScroll = () => {
         this.userScrolling = true;
@@ -545,16 +647,27 @@
       if (this.panel) this.panel.engineChanged();
     }
     nudge(delta) { this.app.engine.setOffset(this.app.engine.offset() - this.app.store.getInt('timing-offset-ms', 0) + delta, false); }
+    /* Background modes: cover (soft cover colour), blur (blurred cover art), dark. */
     async applyColors() {
       const app = this.app, engine = app.engine, info = app.trackInfo;
-      let colors = engine.colors;
-      if (!colors && app.store.setting('color_mode') === 'cover' && info) {
-        const background = await app.coverColor(info.image || info.imageLarge);
-        if (app.trackInfo !== info) return;
-        colors = background && { background, inactive: 'rgb(0,0,0)', active: 'rgb(255,255,255)' };
+      let mode = app.store.setting('color_mode');
+      if (!BACKGROUNDS[mode] && mode !== 'cover') mode = 'cover';
+      const cover = info && (info.imageLarge || info.image) ? (info.imageLarge || info.image).replace('spotify:image:', 'https://i.scdn.co/image/') : '';
+      this.page.dataset.bg = mode;
+      if (mode === 'blur') {
+        const image = cover ? `url("${cover.replace(/["\\]/g, '')}")` : 'none';
+        if (this.bgImage !== image) { this.bgImage = image; this.bg.style.setProperty('--sl-cover', image); }
       }
-      colors = colors || { background: 'rgb(83,83,83)', inactive: 'rgb(0,0,0)', active: 'rgb(255,255,255)' };
-      if (app.store.setting('color_mode') === 'dark') colors = { background: '#121212', inactive: 'rgba(255,255,255,.45)', active: '#fff' };
+      let colors = BACKGROUNDS[mode];
+      if (mode === 'cover') {
+        /* Spotify's lyric colours (when available) are softened the same way. */
+        let hsl = engine.colors && cssToHsl(engine.colors.background);
+        if (!hsl && info) {
+          hsl = await app.coverColor(info.image || info.imageLarge);
+          if (app.trackInfo !== info || app.store.setting('color_mode') !== mode) return;
+        }
+        colors = hsl ? softPalette(hsl) : BACKGROUNDS.neutral;
+      }
       const style = this.page.style;
       style.setProperty('--lyrics-color-background', colors.background);
       style.setProperty('--lyrics-color-inactive', colors.inactive);
@@ -582,10 +695,12 @@
       if (!track) state = { title: app.state && app.state.item ? '当前内容没有歌词' : '没有正在播放的歌曲', sub: '' };
       else if (!usable && engine.busy) state = { loading: true };
       else if (!usable) {
-        const blocked = serverState.ok === false;
+        const failed = /^(请求失败|来源暂不可用)/.test(engine.status);
+        /* Without direct access the provider requests depend on the server relay. */
+        const blocked = failed && netState.direct === false && (serverState.ok === false || serverState.relay === false || !app.store.setting('relay'));
         state = {
-          title: /^(请求失败|来源暂不可用|歌词服务器不可用)/.test(engine.status) ? '无法加载这首歌曲的歌词。稍后再试。' : '我们好像没有这首歌的歌词。',
-          sub: blocked ? `无法连接歌词服务器 ${serverConfig().url}：网易云音乐 / QQ 音乐暂不可用。可在「设置 > 歌词服务器」中检查地址。` : engine.status,
+          title: failed ? '无法加载这首歌曲的歌词。稍后再试。' : engine.status === '纯音乐，没有歌词' ? '这是一首纯音乐。' : '我们好像没有这首歌的歌词。',
+          sub: blocked ? `本机无法直连网易云音乐 / QQ 音乐，歌词服务器 ${serverConfig().url} 的转发也不可用。可在「设置 > 歌词服务器」中检查。` : engine.status,
           actions: true,
         };
       }
@@ -595,6 +710,9 @@
       if (!force && !this.needsScroll && this.lyricsRef === lyrics && this.showTranslation === showTranslation && this.wordSync === app.store.setting('word_sync')) { this.reschedule(); return; }
       /* rebuild lines */
       const scrollToActive = this.lyricsRef !== lyrics || this.needsScroll;
+      /* Same lyrics, new layout (translation shown / hidden, font size, word sync): the line
+       * being followed stays exactly where it is on screen instead of drifting. */
+      const anchor = scrollToActive ? null : this.anchor();
       this.needsScroll = false;
       this.lyricsRef = lyrics; this.showTranslation = showTranslation; this.wordSync = !!app.store.setting('word_sync');
       this.lines = lyrics.lines;
@@ -622,8 +740,28 @@
       if (scrollToActive) {
         if (this.active >= 0) this.els[this.active].scrollIntoView({ block: 'center', behavior: 'auto' });
         else this.scroller.scrollTop = 0;
-      }
+      } else if (anchor) this.restoreAnchor(anchor);
       this.reschedule();
+    }
+    /* The current line if it is on screen, otherwise the first visible line, with its offset. */
+    anchor() {
+      const port = this.scroller.getBoundingClientRect();
+      if (!port.height || !this.els.length) return null;
+      const visible = el => { const r = el.getBoundingClientRect(); return r.bottom > port.top && r.top < port.bottom; };
+      let index = this.active >= 0 && this.els[this.active] && visible(this.els[this.active]) ? this.active : -1;
+      if (index < 0) index = this.els.findIndex(el => el.getBoundingClientRect().bottom > port.top);
+      if (index < 0) return null;
+      const el = this.els[index], rect = el.getBoundingClientRect();
+      /* The first line of text is the reference: a translation below it may appear or vanish. */
+      const text = el.querySelector('.sl-text');
+      return { index, top: (text ? text.getBoundingClientRect().top : rect.top) - port.top };
+    }
+    restoreAnchor(anchor) {
+      const el = this.els[anchor.index];
+      if (!el) return;
+      const text = el.querySelector('.sl-text') || el;
+      const delta = text.getBoundingClientRect().top - this.scroller.getBoundingClientRect().top - anchor.top;
+      if (Math.abs(delta) >= 1) this.scroller.scrollTop += delta;
     }
     renderState(state) {
       this.stateBox.hidden = !state;
@@ -854,7 +992,6 @@
       if (c.bound) tags.push(h('span', { class: 'sl-tag sl-tag-blue' }, '已绑定'));
       if (c.verified) tags.push(h('span', { class: 'sl-tag sl-tag-green' }, '歌词比对'));
       if (c.auto_selected) tags.push(h('span', { class: 'sl-tag sl-tag-green' }, '自动选择'));
-      if (c.ambiguous) tags.push(h('span', { class: 'sl-tag sl-tag-orange' }, '歧义'));
       const delta = c.delta_ms >= 0 ? `${c.delta_ms <= 3000 ? '±' : 'Δ'}${(c.delta_ms / 1000).toFixed(1)}s` : '时长未知';
       const row = h('div', { class: 'sl-row' + (selected ? ' sl-selected' : ''), title: c.reason },
         h('button', { type: 'button', class: 'sl-row-main', onclick: () => this.select(c) },
@@ -888,7 +1025,8 @@
               const button = event.currentTarget; button.disabled = true;
               try {
                 const result = await this.app.engine.bind(c, lyrics);
-                toast(result && result.local ? '已绑定到本机（本地文件不保存到服务器）' : '已保存匹配，歌词已存入服务器');
+                toast(!result ? '保存失败' : result.local ? '已绑定到本机（本地文件不保存到服务器）'
+                  : result.error ? `已在本机绑定；上传服务器失败：${result.error}` : '已保存匹配，歌词已上传到服务器');
                 this.search();
               } catch (e) { toast('保存失败：' + (e.message || e)); button.disabled = false; }
             } }, '使用此歌词'),
@@ -938,9 +1076,12 @@
         }, text))));
       const globalOffset = store.getInt('timing-offset-ms', 0);
       const trackOffset = engine.offset() - globalOffset;
-      const stats = engine.stats;
+      const stats = engine.http.stats, cloudStats = cloud.stats;
       const server = serverConfig();
-      const serverLine = serverState.ok ? `已连接 · v${serverState.version}${serverState.storage === 'r2' ? ' · 匹配保存在 Cloudflare R2' : ''}` : serverState.ok === false ? `未连接${serverState.error ? '：' + serverState.error : ''}` : '检测中…';
+      const serverLine = serverState.ok ? `已连接 · v${serverState.version}${serverState.storage === 'r2' ? ' · 匹配保存在 Cloudflare R2' : ''}${serverState.relay === false ? ' · 未开启转发' : ''}` : serverState.ok === false ? `未连接${serverState.error ? '：' + serverState.error : ''}` : '检测中…';
+      const netLine = netState.direct === true ? `本机直连网易云 / QQ 音乐（${netState.directCount} 次请求）`
+        : netState.direct === false ? `直连被 Spotify 拦截（CORS），${store.setting('relay') ? `经歌词服务器转发（${netState.relayed} 次）` : '已关闭转发'}。用 patch.sh --direct / patch.cmd -Direct 安装可直连`
+        : '尚未发出请求';
       const saveServer = async () => {
         const url = cleanServerUrl(this.serverInput.value);
         if (url && !/^https?:\/\/[^\s/]+/i.test(url)) { toast('地址需以 https:// 开头'); return; }
@@ -965,13 +1106,12 @@
         segmented('preferred_provider', '首选歌词源', [['netease', '网易云音乐'], ['qq', 'QQ 音乐']]),
         toggle('spotify_first', '优先使用 Spotify 歌词', '默认先匹配第三方歌词，Spotify 歌词作为兜底'),
         toggle('verify_lyrics', '歌词比对匹配', '歌名对不上（如罗马音 / 日文）时，用 Spotify 歌词核对同艺术家、同时长的候选，正文一致才自动采用', () => app.engine.track && app.engine.setTrack(app.engine.track, true)),
-        toggle('loose_match', '宽松匹配', '同名、同艺术家、时长相差 1 秒内且一方缺少专辑时视为同一录音；关闭即 spot-lyric 严格规则', () => app.engine.track && app.engine.setTrack(app.engine.track, true)),
         toggle('prefetch', '后台预加载', '切歌时立即匹配，打开歌词页无需等待'),
         h('h3', null, '显示'),
         toggle('translation', '显示译文', '在原文下方显示翻译'),
         toggle('word_sync', '逐字高亮', '歌词带逐字时间时使用逐字效果'),
         segmented('font_scale', '字号', [[0.8, '小'], [1, '标准'], [1.2, '大']]),
-        segmented('color_mode', '背景', [['cover', '封面取色'], ['dark', '深色']]),
+        segmented('color_mode', '背景', [['cover', '封面取色'], ['blur', '封面模糊'], ['dark', '深色']]),
         h('h3', null, '时间校准'),
         offsetRow('全局偏移', globalOffset, v => engine.setOffset(v, true)),
         offsetRow('当前歌曲偏移', trackOffset, v => engine.setOffset(v, false)),
@@ -979,15 +1119,17 @@
         h('div', { class: 'sl-setting' }, h('span', { class: 'sl-setting-text' }, h('span', null, '状态'), h('small', { class: serverState.ok ? 'sl-good-text' : serverState.ok === false ? 'sl-error' : '' }, serverLine)),
           h('button', { type: 'button', class: 'sl-btn sl-btn-ghost sl-btn-small', onclick: async () => { await checkServer(); this.renderBody(); } }, '检测')),
         h('div', { class: 'sl-setting sl-setting-column' },
-          h('span', { class: 'sl-setting-text' }, h('span', null, '服务器地址'), h('small', null, '搜索、匹配和歌词下载都在服务器上进行；点「使用此歌词」后匹配和歌词保存在服务器。可改为自己部署的服务器。')),
+          h('span', { class: 'sl-setting-text' }, h('span', null, '服务器地址'), h('small', null, '搜索、匹配和歌词下载在本机进行；服务器只保存「使用此歌词」和播放栏上传按钮提交的匹配与歌词，供所有设备共享。可改为自己部署的服务器。')),
           this.serverInput, this.tokenInput,
           h('div', { class: 'sl-setting-actions' },
             h('button', { type: 'button', class: 'sl-btn sl-btn-ghost sl-btn-small', onclick: () => { this.serverInput.value = cleanServerUrl(DEFAULT_SERVER); this.tokenInput.value = ''; saveServer(); } }, '恢复默认'),
             h('button', { type: 'button', class: 'sl-btn sl-btn-green sl-btn-small', onclick: saveServer }, '保存'))),
+        h('div', { class: 'sl-setting' }, h('span', { class: 'sl-setting-text' }, h('span', null, '网络'), h('small', { class: netState.direct === true ? 'sl-good-text' : '' }, netLine))),
+        toggle('relay', '允许服务器转发', '本机无法直连时，由歌词服务器原样转发网易云 / QQ 音乐请求（匹配仍在本机进行）'),
         h('div', { class: 'sl-setting' }, h('span', { class: 'sl-setting-text' }, h('span', null, '本次会话'),
-          h('small', null, `${stats.requests} 次请求 · ${fmtBytes(stats.sent_bytes + stats.received_bytes)} · 缓存命中 ${stats.cache_hits} 次`)),
+          h('small', null, `音乐平台 ${stats.requests} 次请求 · 服务器 ${cloudStats.requests} 次 · ${fmtBytes(stats.sent_bytes + stats.received_bytes + cloudStats.sent_bytes + cloudStats.received_bytes)} · 缓存命中 ${stats.cache_hits} 次`)),
           h('button', { type: 'button', class: 'sl-btn sl-btn-ghost sl-btn-small', onclick: async () => { await store.cacheClear(); toast('本机缓存已清理，服务器上的匹配与本地歌词已保留'); } }, '清理缓存')),
-        h('p', { class: 'sl-about' }, `Spot-Lyric for Spotify v${VERSION} · 匹配逻辑来自 spot-lyric：总时长差超过 3 秒不自动绑定，低分或歧义结果需手动确认。`));
+        h('p', { class: 'sl-about' }, `Spot-Lyric for Spotify v${VERSION} · 匹配：繁简归一、版本标签、多艺术家 / CV 别名、分级时长（参考 Lyricify、LDDC）；总时长差超过 3 秒或版本不同不自动绑定。`));
     }
   }
 

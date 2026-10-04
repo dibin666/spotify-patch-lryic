@@ -13,6 +13,20 @@
   content: ""; position: absolute; left: 50%; bottom: 0; width: 4px; height: 4px; border-radius: 50%;
   background-color: currentColor; transform: translateX(-50%);
 }
+/* small "upload current lyrics" companion button */
+.sl-upload {
+  position: relative; display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 24px; height: 32px; padding: 0; margin: 0 -2px 0 0; border: 0; border-radius: 4px; background: none;
+  color: var(--text-subdued, #b3b3b3); cursor: pointer; opacity: .8; transition: color .15s, opacity .15s, transform .1s;
+}
+.sl-upload .sl-upload-icon { display: inline-flex; pointer-events: none; }
+.sl-upload:hover { color: var(--text-base, #fff); opacity: 1; transform: scale(1.06); }
+.sl-upload:focus-visible { outline: 2px solid #fff; outline-offset: -2px; }
+.sl-upload[data-state="off"] { opacity: .3; cursor: default; }
+.sl-upload[data-state="off"]:hover { color: var(--text-subdued, #b3b3b3); transform: none; }
+.sl-upload[data-state="saved"] { color: var(--text-bright-accent, #1ed760); opacity: .9; }
+.sl-upload[data-state="busy"] { cursor: progress; animation: sl-pulse 1s infinite ease-in-out; }
+@keyframes sl-pulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
 .sl-tooltip {
   position: fixed; z-index: 9999; pointer-events: none; max-width: 240px; padding: 4px 8px; border-radius: 4px;
   background: #282828; color: #fff; font: 400 14px/20px var(--encore-body-font-stack, sans-serif);
@@ -29,7 +43,15 @@
   position: absolute; inset: 0; z-index: 30; overflow: hidden; outline: none;
   border-radius: inherit; color: var(--lyrics-color-active);
 }
-.sl-bg { position: absolute; inset: 0; background-color: var(--lyrics-color-background); transition: background-color .25s ease-out; }
+.sl-bg { position: absolute; inset: 0; overflow: hidden; background-color: var(--lyrics-color-background); transition: background-color .4s ease-out; }
+/* "封面模糊": the cover art, heavily blurred and dimmed, behind the lyrics. */
+.sl-bg::before, .sl-bg::after { content: ""; position: absolute; pointer-events: none; opacity: 0; transition: opacity .4s ease-out; }
+.sl-bg::before {
+  inset: -20%; background: var(--sl-cover, none) center / cover no-repeat;
+  filter: blur(72px) saturate(1.15) brightness(.62); transform: translateZ(0);
+}
+.sl-bg::after { inset: 0; background: linear-gradient(180deg, rgba(0, 0, 0, .18), rgba(0, 0, 0, .42)); }
+.sl-page[data-bg="blur"] .sl-bg::before, .sl-page[data-bg="blur"] .sl-bg::after { opacity: 1; }
 .sl-scroll {
   position: absolute; inset: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain;
   scrollbar-width: thin; scrollbar-color: rgba(255, 255, 255, .3) transparent;
@@ -66,7 +88,7 @@
 .sl-line.sl-active { color: var(--lyrics-color-active); }
 .sl-line.sl-past { color: var(--lyrics-color-inactive); opacity: .5; }
 .sl-seekable .sl-line.sl-past, .sl-seekable .sl-line.sl-future { cursor: pointer; transition: color .1s ease-out, opacity .1s ease-out; }
-.sl-seekable .sl-line.sl-past:hover, .sl-seekable .sl-line.sl-future:hover { color: var(--lyrics-color-active); opacity: 1; text-decoration: underline; }
+.sl-seekable .sl-line.sl-past:hover, .sl-seekable .sl-line.sl-future:hover { color: var(--lyrics-color-active); opacity: 1; text-decoration: none; }
 .sl-static .sl-line { color: var(--lyrics-color-active); pointer-events: none; }
 
 /* word-by-word fill on the active line only */
@@ -290,5 +312,5 @@ button.sl-pill-icon:hover { background: rgba(0, 0, 0, .6); }
 .sl-toast.sl-visible { opacity: 1; transform: translate(-50%, 0); }
 
 @media (prefers-reduced-motion: reduce) {
-  .sl-bg, .sl-sync, .sl-toast, .sl-panel { transition: none; animation: none; }
+  .sl-bg, .sl-bg::before, .sl-bg::after, .sl-sync, .sl-toast, .sl-panel, .sl-upload { transition: none; animation: none; }
 }

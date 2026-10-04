@@ -1,12 +1,25 @@
 'use strict';
 /*
- * Requests to the lyric providers. Only a fixed allow-list of NetEase / QQ Music
- * hosts can be reached, redirects are not followed, bodies are capped at 2 MiB.
+ * Relay of provider requests built by the client. Only a fixed allow-list of
+ * NetEase / QQ Music hosts and API paths can be reached, redirects are not
+ * followed, bodies are capped at 2 MiB.
  */
 const ALLOWED_HOSTS = new Set([
   'music.163.com', 'interface.music.163.com', 'interface3.music.163.com',
   'u.y.qq.com', 'c.y.qq.com', 'i.y.qq.com',
 ]);
+/* The endpoints src/core.js uses (search, song detail, lyrics). */
+const ALLOWED_PATHS = new Set([
+  '/api/search/get/web', '/api/song/detail/', '/api/song/detail', '/api/song/lyric', '/api/song/lyric/v1',
+  '/cgi-bin/musicu.fcg', '/v8/fcg-bin/fcg_play_single_song.fcg', '/lyric/fcgi-bin/fcg_query_lyric_new.fcg',
+]);
+function relayAllowed(method, href) {
+  if (method !== 'GET' && method !== 'POST') return false;
+  let url;
+  try { url = new URL(href); } catch (_) { return false; }
+  return url.protocol === 'https:' && !url.port && !url.username && !url.password &&
+    ALLOWED_HOSTS.has(url.hostname) && ALLOWED_PATHS.has(url.pathname);
+}
 const FORWARD_HEADERS = ['referer', 'content-type', 'accept'];
 const MAX_RESPONSE = 2 << 20;
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
@@ -87,4 +100,4 @@ function createTransport(options = {}) {
   }
 }
 
-module.exports = { createTransport, ALLOWED_HOSTS, UpstreamError };
+module.exports = { createTransport, relayAllowed, ALLOWED_HOSTS, ALLOWED_PATHS, UpstreamError };

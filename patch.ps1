@@ -4,8 +4,10 @@
   Spot-Lyric for Spotify (Windows) - injects the third-party lyrics page into the Spotify desktop client.
 
 .EXAMPLE
-  .\patch.cmd                 # install: patch Spotify + restart Spotify (lyrics come from the lyrics server)
+  .\patch.cmd                 # install: patch Spotify + restart Spotify (matching runs locally)
   .\patch.cmd -Server https://lyrics.example.com   # use a self-hosted lyrics server
+  .\patch.cmd -Direct         # start Spotify with --disable-web-security: NetEase / QQ are requested
+                              # directly instead of through the lyrics server relay (-NoDirect undoes it)
   .\patch.cmd status
   .\patch.cmd restore
   .\patch.cmd uninstall
@@ -20,6 +22,8 @@ param(
     [ValidatePattern('^https?://[A-Za-z0-9._~:/-]+$')][string]$Server = 'https://spo.564616.xyz',
     [switch]$NoRestart,
     [switch]$Restart,
+    [switch]$Direct,
+    [switch]$NoDirect,
     [switch]$Quiet
 )
 
@@ -240,6 +244,59 @@ function Stop-Spotify {
     Warn '无法结束 Spotify 进程'
 }
 
+# --------------------------------------------------------------- direct ---
+# Spotify's renderer enforces CORS and NetEase / QQ send no CORS headers, so the
+# plugin reaches them itself only when Spotify runs with --disable-web-security.
+# Opt-in (-Direct): the switch is added to the Spotify shortcuts and to Spotify's
+# own autostart entry. Without it the lyrics server relays the requests.
+$DirectFlag = '--disable-web-security'
+$DirectMarker = Join-Path $DataDir 'direct'
+function Test-DirectMode { Test-Path -LiteralPath $DirectMarker }
+
+function Get-SpotifyShortcuts {
+    $paths = @()
+    if ($env:APPDATA) { $paths += (Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Spotify.lnk') }
+    try { $paths += (Join-Path ([Environment]::GetFolderPath('Desktop')) 'Spotify.lnk') } catch { }
+    return @($paths | Where-Object { Test-Path -LiteralPath $_ })
+}
+
+function Set-DirectMode([bool]$Enable) {
+    if (-not $OnWindows) { return }
+    $flag = [regex]::Escape($DirectFlag)
+    $shell = New-Object -ComObject WScript.Shell
+    foreach ($path in Get-SpotifyShortcuts) {
+        try {
+            $link = $shell.CreateShortcut($path)
+            $arguments = (($link.Arguments -replace $flag, '') -replace '\s+', ' ').Trim()
+            if ($Enable) { $arguments = ($arguments + ' ' + $DirectFlag).Trim() }
+            $link.Arguments = $arguments
+            $link.Save()
+        }
+        catch { Warn "无法修改快捷方式 $path：$($_.Exception.Message)" }
+    }
+    $autostart = Get-ItemProperty -Path $RunKey -Name 'Spotify' -ErrorAction SilentlyContinue
+    if ($autostart -and $autostart.Spotify) {
+        $value = (($autostart.Spotify -replace (' ?' + $flag), '')).TrimEnd()
+        if ($Enable) { $value = "$value $DirectFlag" }
+        Set-ItemProperty -Path $RunKey -Name 'Spotify' -Value $value
+    }
+    if ($Enable) {
+        $null = New-Item -ItemType Directory -Force -Path $DataDir
+        Set-Content -LiteralPath $DirectMarker -Value $DirectFlag -Encoding ASCII
+        Say "已启用本机直连：Spotify 快捷方式和开机自启将以 $DirectFlag 启动"
+        Warn '提示：该参数会关闭 Spotify 内置浏览器的同源限制，可用 patch.cmd -NoDirect 撤销；Spotify 自动更新重建快捷方式后会改用服务器转发'
+    }
+    else {
+        Remove-Item -LiteralPath $DirectMarker -Force -ErrorAction SilentlyContinue
+        Say '已取消本机直连，歌词请求将经服务器转发'
+    }
+}
+
+function Start-Spotify([string]$Dir) {
+    $exe = Join-Path $Dir 'Spotify.exe'
+    if (Test-DirectMode) { Start-Process -FilePath $exe -ArgumentList $DirectFlag } else { Start-Process -FilePath $exe }
+}
+
 # --------------------------------------------------------- server ---
 function Test-Server {
     try { return (Invoke-RestMethod -Uri "$Server/health" -TimeoutSec 8 -UseBasicParsing).version } catch { return $null }
@@ -270,6 +327,7 @@ function Install-Hook {
     Get-ChildItem -LiteralPath $target -Recurse -File | Unblock-File -ErrorAction SilentlyContinue
     $script = Join-Path $target 'patch.ps1'
     $cmd = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" apply -Quiet -Server {1}' -f $script, $Server
+    if (Test-DirectMode) { $cmd += ' -Direct' }
     if ($SpotifyPath) { $cmd += (' -SpotifyPath "{0}"' -f $SpotifyPath) }
     $null = New-ItemProperty -Path $RunKey -Name 'SpotLyricReapply' -Value $cmd -PropertyType String -Force
     Say '已安装登录钩子：每次登录 Windows 时检查并重新注入（Spotify 自动更新后生效）'
@@ -300,9 +358,14 @@ function Invoke-Apply {
     try { $result = Invoke-Patch $dir }
     catch { Fail ("注入失败：{0}`n如果提示文件被占用，请完全退出 Spotify（包括托盘图标）后重试" -f $_.Exception.Message) }
     if ($result -like 'PATCHED*') { Say "已注入歌词插件 v$Version → $($result.Substring(8))" } else { Say "插件已是最新（v$Version），无需修改" }
+    $directChanged = $false
+    if ($Direct -or $NoDirect) {
+        $directChanged = ([bool]$Direct) -ne (Test-DirectMode)
+        Set-DirectMode ([bool]$Direct)
+    }
     if ($OnWindows) {
-        if ($wasRunning -and $needsWrite) { Say '重新启动 Spotify…'; Start-Process -FilePath (Join-Path $dir 'Spotify.exe') }
-        elseif ($Restart) { Stop-Spotify; Start-Process -FilePath (Join-Path $dir 'Spotify.exe') }
+        if ($wasRunning -and $needsWrite) { Say '重新启动 Spotify…'; Start-Spotify $dir }
+        elseif ($Restart -or ($directChanged -and (Test-SpotifyRunning) -and -not $NoRestart)) { Stop-Spotify; Start-Spotify $dir }
         elseif (-not $wasRunning) { Say '下次启动 Spotify 时生效' }
     }
     return $dir
@@ -322,8 +385,8 @@ switch ($Command) {
         if ($wasRunning) { Stop-Spotify }
         $result = Invoke-Restore $dir
         if ($result -eq 'RESTORED') { Say '已还原 Spotify 原始文件' } else { Say 'Spotify 未被修改，无需还原' }
-        if ($Command -eq 'uninstall') { Remove-LegacyProxy; Remove-Hook }
-        if ($wasRunning -and -not $NoRestart) { Start-Process -FilePath (Join-Path $dir 'Spotify.exe') }
+        if ($Command -eq 'uninstall') { Remove-LegacyProxy; Remove-Hook; if (Test-DirectMode) { Set-DirectMode $false } }
+        if ($wasRunning -and -not $NoRestart) { Start-Spotify $dir }
     }
     'status' {
         $dir = Find-Spotify
@@ -336,6 +399,7 @@ switch ($Command) {
         Write-Host "插件版本：v$Version"
         $v = Test-Server
         if ($v) { Write-Host "歌词服务器：运行正常 v$v · $Server" } else { Write-Host "歌词服务器：无法连接 $Server" }
+        if (Test-DirectMode) { Write-Host "网易云 / QQ 请求：本机直连（$DirectFlag）" } else { Write-Host '网易云 / QQ 请求：经歌词服务器转发（-Direct 可改为本机直连）' }
         if ($OnWindows) {
             $hook = (Get-ItemProperty -Path $RunKey -Name 'SpotLyricReapply' -ErrorAction SilentlyContinue)
             if ($hook) { Write-Host '登录钩子：已安装' } else { Write-Host '登录钩子：未安装' }

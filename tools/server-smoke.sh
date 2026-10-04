@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Smoke test for a deployed Spot-Lyric lyrics server (needs curl + python3).
 #   tools/server-smoke.sh https://spo.564616.xyz [api-token]
-# Runs search -> preview -> "使用此歌词" twice (switching lyrics) -> match -> unbind
-# on one track, checking that the stored object always follows the latest choice.
+# The server only stores shared matches and relays provider requests. This runs:
+# relay a NetEase search + lyric download -> upload ("使用此歌词") twice (the stored
+# object must follow the latest upload) -> read back -> unbind, plus input checks.
 # The test binding is removed again at the end (set KEEP=1 to keep it).
 set -uo pipefail
 S="${1:?usage: server-smoke.sh <server-url> [token]}"; S="${S%/}"
 TOKEN="${2:-${SPOT_LYRIC_TOKEN:-}}"
 ID="${SMOKE_TRACK_ID:-0RiRZpuVRbi7oqRdSMwhQY}"
-TRACK="{\"uri\":\"spotify:track:$ID\",\"title\":\"晴天\",\"artists\":[\"周杰伦\"],\"album\":\"叶惠美\",\"duration_ms\":269000}"
+TRACK="{\"uri\":\"spotify:track:$ID\",\"title\":\"十年\",\"artists\":[\"陈奕迅\"],\"album\":\"黑白灰\",\"duration_ms\":205000}"
 HDR=(-H 'Origin: https://xpui.app.spotify.com' -H 'Content-Type: text/plain')
 [[ -n $TOKEN ]] && HDR+=(-H "Authorization: Bearer $TOKEN")
 pass=0; fail=0
@@ -30,56 +31,42 @@ $1" 2>/dev/null; }
 
 echo "== $S"
 call GET /health
-[[ $CODE == 200 ]] && ok "health $(py 'print(d.get("version"), "storage="+str(d.get("storage")))') (${MS}ms)" || { bad "health HTTP $CODE"; exit 1; }
+[[ $CODE == 200 ]] && ok "health $(py 'print(d.get("version"), "storage="+str(d.get("storage")), "relay="+str(d.get("relay")))') (${MS}ms)" || { bad "health HTTP $CODE"; exit 1; }
 
-call POST /api/search "{\"query\":\"晴天 周杰伦\",\"track\":$TRACK}"
-SEARCH="$OUT"
-[[ $CODE == 200 ]] && ok "search: $(py 'print(" | ".join("%s %s" % (g["provider"], g["error"] or len(g["candidates"])) for g in d["providers"]))') (${MS}ms)" || bad "search HTTP $CODE $OUT"
+# Relay: the client builds the provider request, the server only forwards it.
+call POST /api/relay '{"method":"GET","url":"https://music.163.com/api/search/get/web?s=%E5%8D%81%E5%B9%B4%20%E9%99%88%E5%A5%95%E8%BF%85&type=1&offset=0&total=false&limit=5","headers":{"Referer":"https://music.163.com/"}}'
+SONG="$(py 'b=json.loads(d["body"]); print(b["result"]["songs"][0]["id"])')"
+[[ $CODE == 200 && -n $SONG ]] && ok "relay: NetEase search → song $SONG (${MS}ms)" || bad "relay search HTTP $CODE $(py 'print(d.get("error") or d.get("status"))')"
+call POST /api/relay "{\"method\":\"GET\",\"url\":\"https://music.163.com/api/song/lyric?id=${SONG:-0}&lv=-1&kv=-1&tv=-1\",\"headers\":{\"Referer\":\"https://music.163.com/\"}}"
+LRC="$(py 'b=json.loads(d["body"]); print(json.dumps((b.get("lrc") or {}).get("lyric","")))')"
+[[ $CODE == 200 && ${#LRC} -gt 20 ]] && ok "relay: lyric download ${#LRC} bytes (${MS}ms)" || bad "relay lyric HTTP $CODE"
+call POST /api/relay '{"method":"GET","url":"https://example.com/api/search/get/web"}'
+[[ $CODE == 400 ]] && ok "relay rejects hosts outside the allow-list (400)" || bad "relay allow-list HTTP $CODE"
 
-# Two different candidates that really have lyrics (preview), best scores first.
-CANDS=()
-while read -r cand && (( ${#CANDS[@]} < 2 )); do
-  call POST /api/lyrics "{\"candidate\":$cand}"
-  if [[ $CODE == 200 ]] && py 'sys.exit(0 if any(l["text"] for l in (d.get("lyrics") or {}).get("lines", [])) else 1)'; then
-    CANDS+=("$cand")
-    ok "preview $(printf '%s' "$cand" | python3 -c 'import json,sys;c=json.load(sys.stdin);print(c["provider"], c["id"], c["title"])'): $(py 'l=d["lyrics"];print(len(l["lines"]), "lines,", l["sync_type"])') (${MS}ms)"
-  fi
-done < <(printf '%s' "$SEARCH" | python3 -c 'import json,sys
-d=json.load(sys.stdin); cs=sorted((c for g in d["providers"] for c in g["candidates"]), key=lambda c: -c["score"])
-[print(json.dumps(c)) for c in cs[:8]]' 2>/dev/null)
-(( ${#CANDS[@]} == 2 )) || { bad "need two candidates with lyrics, got ${#CANDS[@]}"; echo "passed $pass, failed $fail"; exit 1; }
-
-cid() { printf '%s' "$1" | python3 -c 'import json,sys;c=json.load(sys.stdin);print(c["provider"]+":"+c["id"])'; }
-stored() {  # prints provider:id of the stored match, or "none"
-  call GET "/api/bindings/$ID"
-  if [[ $CODE == 404 ]]; then echo none; else py 'b=d["binding"];print(b["match"]["provider"]+":"+b["match"]["id"])'; fi
+# Upload twice: the stored object follows the latest upload.
+lyrics() {  # lyrics <first line> -> sanitized-lyrics JSON as the client sends it
+  printf '{"source":"netease","sync_type":"line","parser":2,"lines":[{"text":"%s","start_time_ms":1000,"end_time_ms":4000,"words":[]},{"text":"smoke test","start_time_ms":4000,"end_time_ms":8000,"words":[]}]}' "$1"
 }
-for i in 0 1; do
-  call POST /api/bind "{\"track\":$TRACK,\"candidate\":${CANDS[$i]}}"
-  [[ $CODE == 200 ]] && ok "使用此歌词 #$((i + 1)) → $(py 'print(d["status"], "stored="+str(d.get("stored")))') (${MS}ms)" || bad "bind #$((i + 1)) HTTP $CODE $OUT"
-  want="$(cid "${CANDS[$i]}")"; got="$(stored)"
-  [[ $got == "$want" ]] && ok "stored object follows the latest choice: $got" || bad "stored $got, expected $want"
+for i in 1 2; do
+  call POST /api/bind "{\"track\":$TRACK,\"candidate\":{\"provider\":\"netease\",\"id\":\"${SONG:-1}\",\"title\":\"十年\",\"artists\":[\"陈奕迅\"]},\"lyrics\":$(lyrics "upload #$i")}"
+  [[ $CODE == 200 ]] && ok "upload #$i → stored=$(py 'print(d.get("stored"))') (${MS}ms)" || bad "upload #$i HTTP $CODE $OUT"
+  call GET "/api/bindings/$ID"
+  got="$(py 'print(d["binding"]["lyrics"]["lines"][0]["text"])')"
+  [[ $got == "upload #$i" ]] && ok "stored object follows the latest upload: $got" || bad "stored '$got', expected 'upload #$i'"
 done
-call GET "/api/bindings/$ID"
-py 'b=d["binding"];print("     ", b["spotify_url"], "→", b["match"]["provider_name"], b["match"]["url"], "| bind_count", b["bind_count"], "|", b["lrc"].splitlines()[0][:40])'
+py 'b=d["binding"];print("     ", b["spotify_url"], "→", b["match"]["provider_name"], b["match"]["url"], "| bind_count", b["bind_count"], "| lrc hidden:", "lrc" not in b)'
 
-call POST /api/match "{\"track\":$TRACK}"
-[[ $CODE == 200 ]] && py 'sys.exit(0 if d.get("manual") and d.get("lyrics") else 1)' && ok "match serves the stored lyrics: $(py 'print(d["status"], len(d["lyrics"]["lines"]), "lines")') (${MS}ms)" || bad "match HTTP $CODE $(py 'print(d.get("status") or d.get("error"))')"
-
-call POST /api/search "{\"query\":\"晴天 周杰伦\",\"track\":$TRACK}"
-flag="$(py 'print(",".join(c["provider"]+":"+c["id"] for g in d["providers"] for c in g["candidates"] if c.get("bound")))')"
-[[ $flag == "$(cid "${CANDS[1]}")" ]] && ok "search marks the bound result: $flag" || bad "bound flag: '$flag'"
-
-call POST /api/match "{\"track\":{\"uri\":\"spotify:track:$ID\",\"title\":\"x\"},\"settings\":{}}"
-[[ $CODE == 200 ]] && ok "binding is keyed by the Spotify track id (${MS}ms)" || bad "match by id HTTP $CODE"
-
+call POST /api/bind "{\"track\":$TRACK,\"lyrics\":{\"source\":\"spotify\",\"lines\":[{\"text\":\"x\"}]}}"
+[[ $CODE == 422 ]] && ok "Spotify lyrics are refused (422)" || bad "spotify upload HTTP $CODE"
 if [[ -z ${KEEP:-} ]]; then
   call POST /api/unbind "{\"track\":$TRACK}"
-  [[ $CODE == 200 && "$(stored)" == none ]] && ok "unbind removed the stored object" || bad "unbind HTTP $CODE"
+  [[ $CODE == 200 ]] && { call GET "/api/bindings/$ID"; [[ $CODE == 404 ]]; } && ok "unbind removed the stored object" || bad "unbind HTTP $CODE"
 fi
-call POST /api/match '{}'
+call POST /api/bind '{}'
 [[ $CODE == 400 ]] && ok "bad input rejected (400)" || bad "bad input HTTP $CODE"
-OUT="$(curl -s -m 30 -o /dev/null -w '%{http_code}' -H 'Origin: https://evil.example' -X POST "$S/api/match" -d '{}')"
+call POST /api/match '{}'
+[[ $CODE == 410 ]] && ok "retired v1.1 endpoint answers 410" || bad "retired endpoint HTTP $CODE"
+OUT="$(curl -s -m 30 -o /dev/null -w '%{http_code}' -H 'Origin: https://evil.example' -X POST "$S/api/bind" -d '{}')"
 [[ $OUT == 403 ]] && ok "foreign origin rejected (403)" || bad "foreign origin HTTP $OUT"
 echo "passed $pass, failed $fail"
 [[ $fail == 0 ]]

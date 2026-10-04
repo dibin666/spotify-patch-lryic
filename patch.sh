@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Spot-Lyric for Spotify — patches the Spotify desktop client (Linux / macOS)
-# with a third-party lyrics page (NetEase / QQ Music via the Spot-Lyric lyrics server).
+# with a third-party lyrics page (NetEase / QQ Music, matched on this machine;
+# the Spot-Lyric lyrics server stores shared matches and relays blocked requests).
 # Windows: use patch.cmd / patch.ps1.
 #
 # Portable to the bash 3.2 that ships with macOS: no readlink -f, getent,
@@ -13,6 +14,7 @@ DEFAULT_SERVER=https://spo.564616.xyz
 SERVER="${SPOT_LYRIC_SERVER:-$DEFAULT_SERVER}"
 SPOTIFY_PATH="${SPOTIFY_PATH:-}"
 RESTART=auto
+DIRECT=keep
 QUIET=0
 PATCH_CHANGED=1
 case "${SPOT_LYRIC_PLATFORM:-$(uname -s)}" in
@@ -43,6 +45,9 @@ Spot-Lyric for Spotify v$VERSION（Linux / macOS；Windows 请运行 patch.cmd�
   --restart            完成后总是重启 Spotify
   --no-restart         不重启 Spotify
   --server URL         歌词服务器地址（默认 $DEFAULT_SERVER；自部署见 server/README.md）
+  --direct             本机直连网易云 / QQ 音乐：以 --disable-web-security 启动 Spotify（仅 Linux）；
+                       不加此项时请求经歌词服务器转发，匹配始终在本机进行
+  --no-direct          取消 --direct
   -q, --quiet          安静模式
   -h, --help           显示帮助
 USAGE
@@ -62,6 +67,8 @@ while [[ $# -gt 0 ]]; do
     --spotify-path=*) SPOTIFY_PATH="${1#*=}"; shift ;;
     --restart) RESTART=yes; shift ;;
     --no-restart) RESTART=no; shift ;;
+    --direct) DIRECT=on; shift ;;
+    --no-direct) DIRECT=off; shift ;;
     --server) SERVER="${2:?}"; shift 2 ;;
     --server=*) SERVER="${1#*=}"; shift ;;
     -q|--quiet) QUIET=1; shift ;;
@@ -376,11 +383,54 @@ stop_spotify() {
 start_spotify() {
   if [[ $PLATFORM == macos ]]; then as_user open -a "$SPOTIFY_DIR" || warn "请手动启动 Spotify"
   else
-    local launcher=spotify
+    local launcher=spotify flags=()
     command -v spotify >/dev/null 2>&1 || launcher="$SPOTIFY_DIR/spotify"
-    if command -v setsid >/dev/null 2>&1; then as_user env DISPLAY="${DISPLAY:-:0}" setsid -f "$launcher" >/dev/null 2>&1 < /dev/null || warn "请手动启动 Spotify"
-    else as_user env DISPLAY="${DISPLAY:-:0}" nohup "$launcher" >/dev/null 2>&1 < /dev/null & fi
+    direct_enabled && flags=("$DIRECT_FLAG")
+    if command -v setsid >/dev/null 2>&1; then as_user env DISPLAY="${DISPLAY:-:0}" setsid -f "$launcher" ${flags[@]+"${flags[@]}"} >/dev/null 2>&1 < /dev/null || warn "请手动启动 Spotify"
+    else as_user env DISPLAY="${DISPLAY:-:0}" nohup "$launcher" ${flags[@]+"${flags[@]}"} >/dev/null 2>&1 < /dev/null & fi
   fi
+}
+
+# --------------------------------------------------------------- direct ---
+# Spotify's renderer enforces CORS and NetEase / QQ send no CORS headers, so the
+# plugin can only reach them itself when Spotify runs with --disable-web-security
+# (CEF honours the switch). Opt-in: a per-user spotify.desktop overrides the
+# system launcher entry. Without it the lyrics server relays the requests.
+DIRECT_FLAG=--disable-web-security
+DESKTOP_OVERRIDE="$TARGET_HOME/.local/share/applications/spotify.desktop"
+direct_enabled() { [[ $PLATFORM == linux && -f $DESKTOP_OVERRIDE ]] && grep -q '^X-Spot-Lyric=direct' "$DESKTOP_OVERRIDE" 2>/dev/null; }
+enable_direct() {
+  if [[ $PLATFORM == macos ]]; then
+    warn "macOS 无法给从 Dock / 启动台打开的 Spotify 固定启动参数：--direct 未启用，歌词请求将经服务器转发"
+    return 0
+  fi
+  local src="" f
+  for f in /usr/share/applications/spotify.desktop /usr/local/share/applications/spotify.desktop "$SPOTIFY_DIR/spotify.desktop"; do
+    [[ -f $f ]] && { src="$f"; break; }
+  done
+  as_user mkdir -p "$(dirname "$DESKTOP_OVERRIDE")"
+  {
+    if [[ -n $src ]]; then
+      # Add the switch to every Exec= line that does not have it yet.
+      sed -e "/^Exec=/{/$DIRECT_FLAG/!s/^Exec=\([^ ]*\)/Exec=\1 $DIRECT_FLAG/;}" -e '/^X-Spot-Lyric=/d' "$src"
+    else
+      printf '[Desktop Entry]\nType=Application\nName=Spotify\nIcon=spotify-client\nExec=spotify %s %%U\nTerminal=false\nMimeType=x-scheme-handler/spotify;\nCategories=Audio;Music;Player;AudioVideo;\nStartupWMClass=spotify\n' "$DIRECT_FLAG"
+    fi
+    printf 'X-Spot-Lyric=direct\n'
+  } | as_user tee "$DESKTOP_OVERRIDE" >/dev/null
+  say "已启用本机直连：应用菜单中的 Spotify 将以 $DIRECT_FLAG 启动（$DESKTOP_OVERRIDE）"
+  say "其它启动方式（自建快捷方式、AppImage、开机自启）请自行加上 $DIRECT_FLAG；未加时自动改用服务器转发"
+  warn "提示：该参数会关闭 Spotify 内置浏览器的同源限制，可用 ./patch.sh --no-direct 撤销"
+}
+disable_direct() {
+  if direct_enabled; then as_user rm -f "$DESKTOP_OVERRIDE"; say "已取消本机直连，歌词请求将经服务器转发"; fi
+  return 0
+}
+apply_direct() {
+  case "$DIRECT" in
+    on) direct_enabled || PATCH_CHANGED=1; enable_direct ;;
+    off) direct_enabled && PATCH_CHANGED=1; disable_direct ;;
+  esac
 }
 restart_spotify() {
   [[ $RESTART == no ]] && return 0
@@ -449,18 +499,20 @@ case "$COMMAND" in
   install)
     do_apply
     remove_legacy_proxy
+    apply_direct
     restart_spotify
-    say "完成！在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页。"
+    say "完成！在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页；旁边的小箭头可把当前歌词上传到服务器。"
     ;;
   apply)
     do_apply
+    apply_direct
     restart_spotify
     ;;
   restore|uninstall)
     detect_spotify || die "没有找到 Spotify"
     result="$(run_patcher restore)" || die "还原失败：$result"
     if [[ $result == *RESTORED* ]]; then say "已还原 Spotify 原始文件"; macos_resign; else say "Spotify 未被修改，无需还原"; fi
-    if [[ $COMMAND == uninstall ]]; then remove_legacy_proxy; remove_hook; fi
+    if [[ $COMMAND == uninstall ]]; then remove_legacy_proxy; remove_hook; disable_direct; fi
     PATCH_CHANGED=1; [[ $result == *RESTORED* ]] && restart_spotify
     ;;
   status)
@@ -472,6 +524,7 @@ case "$COMMAND" in
     else echo "Spotify：未找到"; fi
     echo "插件版本：v$VERSION"
     server_status
+    direct_enabled && echo "网易云 / QQ 请求：本机直连（$DIRECT_FLAG）" || echo "网易云 / QQ 请求：经歌词服务器转发（--direct 可改为本机直连）"
     hook_status
     ;;
   hook) install_hook ;;

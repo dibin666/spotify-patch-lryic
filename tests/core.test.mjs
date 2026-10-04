@@ -30,19 +30,66 @@ test('match scoring and selection mirrors spot-lyric rules', () => {
   assert.equal(live.reason, '歌曲版本不一致');
   const cover = core.matchScore(track, { provider: 'netease', id: '4', title: '晴天', artists: ['Lucky小爱'], album: '', duration_ms: 269000 });
   assert.equal(cover.reason, '主艺术家不匹配');
+  assert.ok(live.score < 70, 'a different version never looks like a near-perfect result');
   const list = core.matchSort([cover, long, good, live], 'netease');
   assert.equal(list[0], good);
   assert.equal(core.matchSelect(list), good);
-  // Ambiguity: two different eligible recordings within 8 points -> no automatic pick.
+  // Every eligible candidate is the same song: the best one is taken (LDDC / Lyricify), no refusal on near-ties.
   const other = core.matchScore(track, { provider: 'netease', id: '5', title: '晴天', artists: ['周杰伦'], album: '叶惠美', duration_ms: 271000 });
-  const ambiguous = core.matchSort([good, other], 'qq');
-  assert.ok(other.eligible);
-  assert.equal(core.matchSelect(ambiguous), null);
-  // Strict spot-lyric rule: a missing album makes two candidates different recordings; loose mode does not.
-  const noAlbum = core.matchScore(track, { provider: 'qq', id: '6', title: '晴天', artists: ['周杰伦'], album: '', duration_ms: 268800 });
-  const pair = core.matchSort([good, noAlbum], 'qq');
-  assert.equal(core.matchSelect(pair), null);
-  assert.equal(core.matchSelect(pair, true), pair[0]);
+  assert.ok(other.eligible && other.score < good.score);
+  assert.equal(core.matchSelect([other, good]), good);
+  // The preferred source wins when it is within 10 points of the best.
+  assert.equal(core.matchSelect([other, good], 'netease'), other);
+  const weak = core.matchScore(track, { provider: 'netease', id: '6', title: '晴天', artists: ['周杰伦'], album: '最佳精选', duration_ms: 271900 });
+  assert.ok(weak.eligible && good.score - weak.score > 10, `${good.score} vs ${weak.score}`);
+  assert.equal(core.matchSelect([weak, good], 'netease'), good);
+  assert.equal(core.matchSelect([cover, long, live]), null);
+});
+
+test('matching: traditional / simplified, artist order, CV aliases, featured + remaster notes, QQ seconds', () => {
+  const ok = (track, candidate) => core.matchScore({ album: '', ...track }, { provider: 'netease', id: '1', album: '', ...candidate });
+  // Spotify often ships Taiwanese metadata.
+  assert.equal(core.normalize('說好的幸福呢'), '说好的幸福呢');
+  const t2s = ok({ title: '說好的幸福呢', artists: ['周杰倫'], album: '魔杰座', duration_ms: 255000 }, { title: '说好的幸福呢', artists: ['周杰伦'], album: '魔杰座', duration_ms: 255300 });
+  assert.ok(t2s.eligible && t2s.score > 95, t2s.reason);
+  // Artist order does not matter; the main artist must be present.
+  assert.equal(core.artistSimilarity(['A', 'B'], ['B', 'A']), 1);
+  assert.ok(core.artistSimilarity(['A'], ['A', 'Guest']) > 0.9);
+  assert.ok(core.artistSimilarity(['A', 'Guest'], ['Guest']) < 0.75, 'a guest cannot replace the main artist');
+  // "角色 (CV: 声优)" and combined "A/B" entries.
+  assert.equal(core.artistSimilarity(['青山吉能'], ['後藤ひとり (CV:青山吉能)']), 1);
+  assert.ok(core.artistSimilarity(['Ado'], ['Ado/初音ミク']) > 0.9);
+  // Neutral notes are ignored, version notes are not.
+  const feat = ok({ title: 'Song (feat. B) - 2011 Remaster', artists: ['A', 'B'], album: 'X (Deluxe Edition)', duration_ms: 200000 }, { title: 'Song', artists: ['A'], album: 'X', duration_ms: 200400 });
+  assert.ok(feat.eligible, feat.reason);
+  assert.equal(core.titleCore('勇者 (TV动画《葬送的芙莉莲》片头曲)'), '勇者');
+  assert.equal(core.titleCore('Song - From "The Movie"'), 'Song');
+  assert.equal(ok({ title: 'Song - Original Mix', artists: ['A'], duration_ms: 1000 }, { title: 'Song', artists: ['A'], duration_ms: 1000 }).eligible, true);
+  assert.equal(ok({ title: 'Song', artists: ['A'], duration_ms: 1000 }, { title: 'Song (Piano Ver.)', artists: ['A'], duration_ms: 1000 }).reason, '歌曲版本不一致');
+  assert.equal(ok({ title: 'Song', artists: ['A'], duration_ms: 1000 }, { title: 'Song (Off Vocal)', artists: ['A'], duration_ms: 1000 }).reason, '歌曲版本不一致');
+  // Provider aliases (NetEase transNames / alias, QQ subtitle).
+  const alias = ok({ title: 'Racing Into The Night', artists: ['YOASOBI'], duration_ms: 261000 }, { title: '夜に駆ける', aliases: ['Racing Into The Night'], artists: ['YOASOBI'], duration_ms: 261013 });
+  assert.ok(alias.eligible, alias.reason);
+  // QQ only reports whole seconds.
+  assert.equal(core.durationDelta(269765, { provider: 'qq', duration_ms: 269000 }), 0);
+  assert.equal(core.durationDelta(269765, { provider: 'netease', duration_ms: 269000 }), 765);
+  assert.deepEqual([0, 200, 600, 1200, 3000, 4000].map(core.durationScore), [1, 0.95, 0.9, 0.8, 0.55, 0]);
+  // Names in different scripts are reported as such (lyric check / manual choice).
+  assert.match(ok({ title: '十年', artists: ['Eason Chan'], duration_ms: 205000 }, { title: '十年', artists: ['陈奕迅'], duration_ms: 205423 }).reason, /语言不同/);
+  // Widening query cascade.
+  assert.deepEqual(core.searchQueries({ title: 'Song (feat. B)', artists: ['A', 'B'] }).map(q => [q.text, q.titleOnly]),
+    [['Song (feat. B) A', false], ['Song A', false], ['Song', true]]);
+});
+
+test('sanitizeLyrics keeps the known shape only', () => {
+  const clean = core.sanitizeLyrics({ source: 'evil', sync_type: 'word', x: 1, lines: [
+    { text: 'b', start_time_ms: 2000, end_time_ms: 1, words: [{ text: 'b', start_time_ms: 2000, end_time_ms: 2500, y: 2 }] },
+    { text: 'a\u0000', start_time_ms: 1000, end_time_ms: 2000, translated_text: '甲', words: 'nope' }, null] });
+  assert.equal(clean.source, 'local');
+  assert.equal(clean.x, undefined);
+  assert.deepEqual(clean.lines.map(l => [l.text, l.start_time_ms, l.end_time_ms, l.translated_text]), [['a', 1000, 2000, '甲'], ['b', 2000, 2000, undefined]]);
+  assert.deepEqual(clean.lines[1].words, [{ text: 'b', start_time_ms: 2000, end_time_ms: 2500 }]);
+  assert.equal(core.sanitizeLyrics({ lines: [{ text: '' }] }), null);
 });
 
 test('LRC parsing: multi stamps, offset, enhanced words, translation', () => {
@@ -73,7 +120,10 @@ test('Spotify color-lyrics conversion', () => {
 
 test('provider candidates and requests', () => {
   const ne = core.providerCandidates('netease', { code: 200, result: { songs: [{ id: 1, name: 'A', duration: 1000, artists: [{ name: 'X' }], album: { name: 'Al' } }, { id: 1, name: 'dup' }] } });
-  assert.deepEqual(ne, [{ provider: 'netease', id: '1', mid: '', title: 'A', album: 'Al', duration_ms: 1000, artists: ['X'] }]);
+  assert.deepEqual(ne, [{ provider: 'netease', id: '1', mid: '', title: 'A', album: 'Al', duration_ms: 1000, artists: ['X'], aliases: [] }]);
+  const aliased = core.providerCandidates('netease', { result: { songs: [{ id: 2, name: '夜に駆ける', alias: [], transNames: ['向夜晚奔去'], duration: 1, artists: [] }] } });
+  assert.deepEqual(aliased[0].aliases, ['向夜晚奔去']);
+  assert.deepEqual(core.candidateFromJson(core.candidateJson(aliased[0])).aliases, ['向夜晚奔去']);
   const qq = core.providerCandidates('qq', { req_1: { data: { body: { song: { list: [{ id: 9, mid: 'm9', title: 'B', interval: 200, singer: [{ name: 'Y' }], album: { title: 'Bl' }, group: [{ id: 10, mid: 'm10', title: 'B', interval: 201, singer: [{ name: 'Y' }], album: { name: 'Bl2' } }] }] } } } } });
   assert.equal(qq.length, 2); assert.equal(qq[1].album, 'Bl2'); assert.equal(qq[0].duration_ms, 200000);
   assert.match(core.searchRequest('netease', 'https://music.163.com/#/song?id=186001').url, /song\/detail\/\?id=186001/);
@@ -184,7 +234,8 @@ test('engine: automatic match, caching and negative cache (offline)', async () =
   await engine.setTrack(track);
   assert.equal(engine.status, '已匹配歌词 · 网易云音乐');
   assert.equal(engine.lyrics.lines[0].text, '故事的小黄花');
-  assert.equal(calls.length, 2);
+  assert.equal(calls.length, 3, 'both sources searched together, one lyric download');
+  assert.equal(engine.match.id, '7');
   // Same track again from a fresh engine with the same store: served from cache.
   const again = new core.Engine({ store, http: new core.Http(async () => { throw new Error('no network expected'); }), settings: () => ({ preferred_provider: 'netease' }) });
   await again.setTrack(track);
@@ -214,11 +265,43 @@ test('engine: manual search, bind and unbind (offline)', async () => {
   assert.ok(result.providers[1].error, 'qq failure is reported per provider');
   const candidate = result.providers[0].candidates[0];
   const preview = await engine.preview(candidate);
-  await engine.bind(candidate, preview);
-  assert.equal(engine.status, '已保存人工匹配');
+  const bound = await engine.bind(candidate, preview);
+  assert.equal(engine.status, '已绑定歌词 · 网易云音乐');
+  assert.match(bound.error, /未配置歌词服务器/, 'no lyrics server: bound on this machine only');
   await engine.setTrack({ ...track, title: 'x' }); await engine.setTrack(track);
   assert.equal(engine.status, '已绑定歌词 · 缓存');
   assert.equal((await engine.search('Other Z')).providers[0].candidates[0].bound, true);
+});
+
+test('engine: cross-script artists are confirmed by lyric text; instrumental is a final answer (offline)', async () => {
+  const lrc = list => list.map((t, i) => `[00:${String(10 + i * 3).padStart(2, '0')}.00]${t}`).join('\n');
+  const LINES = ['如果那两个字没有颤抖', '我不会发现我难受', '怎么说出口', '也不过是分手', '如果对于明天没有要求'];
+  const queries = [];
+  const { engine } = fakeEngine((req) => {
+    if (req.url.includes('/search/')) {
+      queries.push(decodeURIComponent(/s=([^&]*)/.exec(req.url)[1]));
+      return { status: 200, body: JSON.stringify({ code: 200, result: { songs: [
+        { id: 66842, name: '十年', duration: 205423, artists: [{ name: '陈奕迅' }], album: { name: '黑白灰' } },
+        { id: 9, name: 'Ten Years', duration: 130000, artists: [{ name: 'Someone' }], album: { name: '' } }] } }) };
+    }
+    if (req.url.includes('u.y.qq.com')) return { status: 200, body: JSON.stringify({ code: 0, req_1: { code: 0, data: { body: { song: { list: [] } } } } }) };
+    return { status: 200, body: JSON.stringify({ code: 200, lrc: { lyric: lrc(LINES) } }) };
+  });
+  engine.deps.spotify = async () => ({ lyrics: core.parseLrc(lrc(LINES), null, 'spotify'), colors: null });
+  engine.deps.settings = () => ({ preferred_provider: 'netease', verify_lyrics: true });
+  await engine.setTrack({ uri: 'spotify:track:cccccccccccccccccccccc', title: 'Ten Years', artists: ['Eason Chan'], album: 'Black, White & Grey', duration_ms: 205000 });
+  assert.equal(engine.status, '已匹配歌词 · 网易云音乐（歌词比对 100%）');
+  assert.equal(engine.match.id, '66842');
+  assert.ok(queries.includes('ten years'), 'title-only query runs when nothing was eligible');
+
+  const inst = fakeEngine((req) => {
+    if (req.url.includes('/search/')) return { status: 200, body: JSON.stringify({ code: 200, result: { songs: [{ id: 5, name: 'Interlude', duration: 90000, artists: [{ name: 'A' }], album: { name: '' } }] } }) };
+    if (req.url.includes('u.y.qq.com')) return { status: 200, body: JSON.stringify({ code: 0, req_1: { code: 0, data: { body: { song: { list: [] } } } } }) };
+    return { status: 200, body: JSON.stringify({ code: 200, nolyric: true }) };
+  });
+  await inst.engine.setTrack({ uri: 'spotify:track:dddddddddddddddddddddd', title: 'Interlude', artists: ['A'], album: '', duration_ms: 90000 });
+  assert.equal(inst.engine.status, '纯音乐，没有歌词');
+  assert.equal(inst.calls.filter(r => r.url.includes('/song/lyric')).length, 1, 'no further candidates are tried');
 });
 
 const live = process.env.SPOT_LYRIC_OFFLINE ? test.skip : test;
