@@ -23,12 +23,12 @@ macOS / Linux 运行 `patch.sh`，Windows 运行 `patch.cmd`（实际执行 `pat
 ```
 [1] 选择使用方式                     云端服务器 / 纯本地
 云端：  [2] 歌词服务器地址
-        [3] 是否在本机请求网易云 / QQ？  本地服务 / 直连 / 不在本机请求（经服务器转发）
-纯本地：[2] 网易云 / QQ 请求怎么发出？   本地服务 / 直连
+        [3] 网易云 / QQ 请求怎么发出？   直连 / 经歌词服务器转发（macOS 不支持直连，不问）
+纯本地：使用本地服务，不用再选
 最后：  Spotify 更新后自动重新注入？
 ```
 
-注入由脚本自己完成，不需要额外程序：`patch.sh` 只用系统自带的工具（bash、gzip、od、awk、curl，macOS 自带的 bash 3.2 即可），不需要 python、zip / unzip；`patch.ps1` 只用 Windows 自带的 PowerShell 5.1。只有选择「本地服务」请求方式时（云端或纯本地都可以），才会获取本地服务程序 `spot-lyric-server`：本机装了 Go 就从源码编译，否则下载 CI 编译好的对应版本（GitHub Releases `v<VERSION>`，带 SHA256 校验）。
+注入由脚本自己完成，不需要额外程序：`patch.sh` 只用系统自带的工具（bash、gzip、od、awk、curl，macOS 自带的 bash 3.2 即可），不需要 python、zip / unzip；`patch.ps1` 只用 Windows 自带的 PowerShell 5.1。只有选择纯本地时，才会获取本地服务程序 `spot-lyric-server`：本机装了 Go 就从源码编译，否则下载 CI 编译好的对应版本（GitHub Releases `v<VERSION>`，带 SHA256 校验）。
 
 > Windows 不支持 Microsoft Store 版 Spotify，请从官网下载安装。Spotify 自动更新后重新运行即可，选了「自动重新注入」的话会自己处理。
 
@@ -61,21 +61,14 @@ patch.cmd             # Windows（双击也可以）
 
 ## 使用方式
 
-两个选择：歌词保存在哪里（`--mode`），以及网易云 / QQ 音乐的请求怎么发出（`--request`）。
-
-| 使用方式 | `--mode` | 远程服务器 | 可选的请求方式 |
-| --- | --- | --- | --- |
-| 云端服务器（默认） | `cloud` | 保存共享的匹配和歌词 | 本地服务 / 直连 / 经服务器转发 |
-| 纯本地 · 本地服务 | `local` | 无 | 本地服务 |
-| 纯本地 · 直连 | `direct` | 无 | 直连 |
-
-Spotify 内置浏览器会强制执行 CORS，而网易云 / QQ 音乐的接口不允许跨域读取，所以请求需要通过下面的某一条路径发出：
-
-| 请求方式 | `--request` | 怎么发出 | 需要安装 | 系统 |
+| 使用方式 | 参数 | 远程服务器 | 网易云 / QQ 请求怎么发出 | 系统 |
 | --- | --- | --- | --- | --- |
-| 本地服务 | `service` | 由本机 `127.0.0.1:38917` 的本地服务（`spot-lyric-server`）转发 | 本地服务（自动下载 / 编译） | 全部 |
-| 直连 | `direct` | Spotify 以 `--disable-web-security` 启动，请求直接从内置浏览器发出 | 无 | Windows / Linux |
-| 经服务器转发 | `server` | 歌词服务器原样转发（只转发白名单域名和接口），仅云端模式 | 无 | 全部 |
+| 云端服务器 · 直连 | `--mode cloud --request direct` | 保存共享的匹配和歌词 | Spotify 以 `--disable-web-security` 启动，请求从本机直接发出 | Windows / Linux |
+| 云端服务器 · 经服务器转发（默认） | `--mode cloud --request server` | 保存共享的匹配和歌词 | 歌词服务器原样转发（只转发白名单域名和接口） | 全部 |
+| 纯本地 | `--mode local` | 无 | 本机 `127.0.0.1:38917` 的本地服务（`spot-lyric-server`，仅此方式需要下载 / 编译）转发 | 全部 |
+| 纯本地 · 直连（高级，仅命令行） | `--mode direct` | 无 | 不装本地服务，Spotify 以 `--disable-web-security` 启动 | Windows / Linux |
+
+Spotify 内置浏览器会强制执行 CORS，而网易云 / QQ 音乐的接口不允许跨域读取，所以请求必须走上面其中一条路径。
 
 **始终本地优先**：无论安装时选了哪种方式，插件都按「直连 → 本地服务 → 歌词服务器」的顺序尝试。能直连就直连；本地服务在运行就用本地服务；两者都不可用时，云端模式才交给歌词服务器转发，纯本地模式则直接报错，从不访问远程服务器。
 
@@ -102,10 +95,10 @@ Spotify 内置浏览器会强制执行 CORS，而网易云 / QQ 音乐的接口�
 | 操作 | 命令 |
 | --- | --- |
 | 引导安装 / 更新 / 更换使用方式 | `./patch.sh` |
-| 不询问，直接用纯本地 · 本地服务 | `./patch.sh --mode local -y` |
-| 不询问，直接用纯本地 · 直连 | `./patch.sh --mode direct -y` |
-| 不询问，云端 + 本机请求（本地服务） | `./patch.sh --mode cloud --request service -y` |
+| 不询问，纯本地 | `./patch.sh --mode local -y` |
 | 不询问，云端 + 本机直连 | `./patch.sh --mode cloud --request direct -y` |
+| 不询问，云端 + 经服务器转发 | `./patch.sh --mode cloud --request server -y` |
+| 不询问，纯本地 · 直连（不装本地服务） | `./patch.sh --mode direct -y` |
 | 不询问，使用自建服务器 | `./patch.sh --server https://lyrics.example.com -y` |
 | 运行状态 | `./patch.sh status` |
 | 只重新注入（沿用上次的方式） | `./patch.sh apply` |
@@ -113,7 +106,7 @@ Spotify 内置浏览器会强制执行 CORS，而网易云 / QQ 音乐的接口�
 | 彻底卸载（含钩子、本地服务、直连参数） | `./patch.sh uninstall` |
 | 安装 / 移除自动重新注入 | `./patch.sh hook` / `./patch.sh unhook` |
 
-常用选项：`--spotify-path P`（手动指定 Spotify 位置；macOS 填 Spotify.app）、`--hook` / `--no-hook`、`--restart` / `--no-restart`、`-y`（不询问）、`-q`（安静模式）。完整说明见 `./patch.sh --help`。旧版的 `-Server`、`-NoRestart`、`-SpotifyPath` 等写法仍然有效；`--direct` / `-Direct` 表示「纯本地 · 直连」，`--no-direct` 等同 `--request server`。没有记录过选择时，1.2 版 `--direct` 留下的直连启动项会被识别为「云端 + 直连」。
+常用选项：`--spotify-path P`（手动指定 Spotify 位置；macOS 填 Spotify.app）、`--hook` / `--no-hook`、`--restart` / `--no-restart`、`-y`（不询问）、`-q`（安静模式）。完整说明见 `./patch.sh --help`。旧版的 `-Server`、`-NoRestart`、`-SpotifyPath` 等写法仍然有效；`--direct` / `-Direct` 表示「纯本地 · 直连」，`--no-direct` 等同 `--request server`，`--request service` 等同 `--mode local`。没有记录过选择时，1.2 版 `--direct` 留下的直连启动项会被识别为「云端 + 直连」。
 
 macOS 注入后会自动重新签名（ad-hoc）。Linux 的 Spotify 装在系统目录时，写入这一步会通过 sudo 请求权限。
 

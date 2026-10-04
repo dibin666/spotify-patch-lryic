@@ -6,12 +6,11 @@
 
 .DESCRIPTION
   Usage modes (asked step by step, or --mode):
-    cloud   lyrics server stores shared matches (default)
-    local   pure local, NetEase / QQ through the local service (127.0.0.1:38917)
-    direct  pure local, Spotify runs with --disable-web-security
-  How NetEase / QQ are requested on this machine (--request), also in cloud mode:
-    service local service (spot-lyric-server: downloaded / built only when chosen)
-    direct  --disable-web-security            server  only through the lyrics server relay
+    cloud   lyrics server stores shared matches (default); NetEase / QQ requests (--request)
+            go direct (--disable-web-security) or through the lyrics server relay
+    local   pure local: the local service (spot-lyric-server on 127.0.0.1:38917,
+            downloaded / built only for this mode) relays NetEase / QQ requests
+    direct  pure local without the service: --disable-web-security (advanced)
   The plugin always prefers local paths: direct -> local service -> lyrics server.
 
 .EXAMPLE
@@ -66,18 +65,18 @@ Spot-Lyric for Spotify v$Version（Windows；macOS / Linux 运行 ./patch.sh，�
   unhook       移除自动重新注入
 
 使用方式（--mode）:
-  cloud        云端服务器（默认）：服务器保存共享的匹配与歌词
-  local        纯本地 · 本地服务：不连接远程服务器，请求经 127.0.0.1:38917 的本地服务
-  direct       纯本地 · 直连：不连接远程服务器，以 --disable-web-security 启动 Spotify
+  cloud        云端服务器（默认）：服务器保存共享的匹配与歌词；网易云 / QQ 请求见 --request
+  local        纯本地：不连接远程服务器，请求经本机 127.0.0.1:38917 的本地服务
+               （spot-lyric-server，仅此方式需要下载 / 编译）
+  direct       纯本地，不用本地服务而以 --disable-web-security 启动 Spotify（高级）
 
-网易云 / QQ 请求方式（--request，云端模式也可在本机请求；插件始终本地优先：直连 → 本地服务 → 歌词服务器）:
-  service      本地服务（spot-lyric-server，仅选择它时才下载 / 编译）
-  direct       直连（--disable-web-security）
-  server       不在本机请求，全部经歌词服务器转发（仅云端模式）
+云端模式下网易云 / QQ 的请求方式（--request；插件始终本地优先：直连 → 本地服务 → 歌词服务器）:
+  direct       直连：以 --disable-web-security 启动 Spotify，请求从本机发出
+  server       经歌词服务器原样转发
 
 选项:
   --mode M             使用方式：cloud / local / direct（不指定时分步询问）
-  --request R          网易云 / QQ 请求方式：service / direct / server（不指定时分步询问）
+  --request R          云端模式的网易云 / QQ 请求方式：direct / server（不指定时分步询问）
   --server URL         歌词服务器地址（默认 $DefaultServer）
   --local / --direct   等同 --mode local / --mode direct
   --spotify-path P     手动指定 Spotify 安装目录
@@ -154,8 +153,14 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
     }
 }
 if (-not $Command) { $Command = 'install' }
-if ($Mode -eq 'local' -and $Request -and $Request -ne 'service') { Fail '--mode local 只能配合 --request service（纯本地直连请用 --mode direct）' }
-if ($Mode -eq 'direct' -and $Request -and $Request -ne 'direct') { Fail '--mode direct 只能配合 --request direct（纯本地本地服务请用 --mode local）' }
+# --request is the cloud mode's choice; "service" means the pure local mode.
+if ($Request -eq 'service') {
+    if ($Mode -eq 'cloud') { Fail '本地服务只用于纯本地模式（--mode local）；云端模式的 --request 可选 direct / server' }
+    $Mode = 'local'; $Request = ''
+}
+if ($Mode -eq 'local' -and $Request) { Fail '纯本地模式（--mode local）使用本地服务，不需要 --request' }
+if ($Mode -eq 'direct' -and $Request -eq 'server') { Fail '--mode direct 是不连接服务器的纯本地模式，不能配合 --request server' }
+if ($Mode -eq 'direct') { $Request = '' }
 
 # --------------------------------------------------------------- config ---
 $ConfigFile = Join-Path $DataDir 'config'
@@ -628,13 +633,13 @@ function Get-CurrentRequest([string]$M) {
     if ($M -eq 'local') { return 'service' }
     if ($M -eq 'direct') { return 'direct' }
     if ($Request) { return $Request }
-    if ($CfgRequest) { return $CfgRequest }
-    if (Test-ServiceInstalled) { return 'service' }
+    if ($CfgRequest -in 'direct', 'server') { return $CfgRequest }
     if (Test-DirectMode) { return 'direct' }
     return 'server'
 }
-$ServiceHint = "在 127.0.0.1:38917 运行一个后台小服务（spot-lyric-server，约 10 MB 内存），登录时自动启动；`n只有选择它时才下载（装有 Go 时从源码编译）这个程序，不改 Spotify 的启动方式"
-$DirectHint = "以 --disable-web-security 启动 Spotify，没有后台进程，不需要下载任何程序；会关闭内置浏览器的同源限制`n修改 Spotify 快捷方式和开机自启；使用单独的配置目录，首次需要重新登录 Spotify"
+$PureHint = "不连接任何远程服务器：在本机 127.0.0.1:38917 运行一个小服务（登录时自动启动）转发网易云 / QQ 请求；`n搜索、匹配、歌词下载都在本机进行，绑定的歌词只保存在本机（会下载或编译 spot-lyric-server，约 10 MB）"
+$DirectHint = "以 --disable-web-security 启动 Spotify，请求从本机直接发出，不需要下载任何程序；会关闭内置浏览器的同源限制`n修改 Spotify 快捷方式和开机自启；使用单独的配置目录，首次需要重新登录 Spotify"
+$ServerHint = 'Spotify 内置浏览器会拦截跨域请求，由歌词服务器原样转发（搜索和匹配仍在本机），什么都不用改'
 $Script:Step = 0
 function Next-Step { $Script:Step++; return "[$Script:Step]" }
 
@@ -642,22 +647,18 @@ function Get-Plan {
     $p = @{ Mode = $Mode; Request = ''; Server = (Get-CurrentServer); Hook = $false }
     if (-not $p.Mode -and ($Server -or $Request -eq 'server')) { $p.Mode = 'cloud' }
     $current = Get-CurrentMode
-    $currentReq = Get-CurrentRequest $current
+    $currentReq = Get-CurrentRequest 'cloud'
     if (-not $p.Mode) {
         $kind = Select-Choice (Next-Step) '选择使用方式' $(if ($current -eq 'cloud') { 'cloud' } else { 'pure' }) @(
-            @{ Key = 'cloud'; Label = '云端服务器'; Hint = "歌词服务器保存「使用此歌词」和上传按钮提交的匹配，多台设备共享；`n下一步可选择是否在本机请求网易云 / QQ 音乐（始终本地优先）" },
-            @{ Key = 'pure'; Label = '纯本地'; Hint = '不连接任何远程服务器：搜索、匹配、歌词下载都在本机进行，绑定的歌词只保存在本机' })
+            @{ Key = 'cloud'; Label = '云端服务器'; Hint = '歌词服务器保存「使用此歌词」和上传按钮提交的匹配，多台设备共享' },
+            @{ Key = 'pure'; Label = '纯本地'; Hint = $PureHint })
         if ($kind -eq 'cloud') { $p.Mode = 'cloud' }
-        elseif ($Request) { $p.Mode = $(if ($Request -eq 'direct') { 'direct' } else { 'local' }) }
-        else {
-            $p.Mode = Select-Choice (Next-Step) '纯本地：网易云 / QQ 音乐的请求怎么发出？（Spotify 内置浏览器会拦截跨域请求）' $(if ($currentReq -eq 'direct') { 'direct' } else { 'local' }) @(
-                @{ Key = 'local'; Label = '本地服务'; Hint = $ServiceHint },
-                @{ Key = 'direct'; Label = '直连'; Hint = $DirectHint })
-        }
+        elseif ($Request -eq 'direct' -or (-not $Request -and $current -eq 'direct')) { $p.Mode = 'direct' }   # kept only when asked for (--mode direct)
+        else { $p.Mode = 'local' }
     }
     switch ($p.Mode) {
-        'local' { if ($Request -and $Request -ne 'service') { Fail '--mode local 只能配合 --request service（纯本地直连请用 --mode direct）' }; $p.Request = 'service' }
-        'direct' { if ($Request -and $Request -ne 'direct') { Fail '--mode direct 只能配合 --request direct（纯本地本地服务请用 --mode local）' }; $p.Request = 'direct' }
+        'local' { $p.Request = 'service' }
+        'direct' { $p.Request = 'direct' }
         'cloud' {
             if ($Script:Interactive -and -not $Server) {
                 Write-Host ''
@@ -672,10 +673,9 @@ function Get-Plan {
             }
             if ($Request) { $p.Request = $Request }
             else {
-                $p.Request = Select-Choice (Next-Step) '是否在本机请求网易云 / QQ 音乐？（插件始终本地优先：直连 → 本地服务 → 歌词服务器）' $currentReq @(
-                    @{ Key = 'service'; Label = '本地服务'; Hint = $ServiceHint },
+                $p.Request = Select-Choice (Next-Step) '网易云 / QQ 音乐的请求怎么发出？' $currentReq @(
                     @{ Key = 'direct'; Label = '直连'; Hint = $DirectHint },
-                    @{ Key = 'server'; Label = '不在本机请求'; Hint = '全部经歌词服务器原样转发（搜索和匹配仍在本机），什么都不用安装' })
+                    @{ Key = 'server'; Label = '经歌词服务器转发'; Hint = $ServerHint })
             }
         }
     }
@@ -696,7 +696,7 @@ function Get-Plan {
         Write-Host '即将执行：'
         Write-Host "  • 注入歌词插件 v$Version（使用方式：$(Mode-Name $p.Mode)）"
         if ($p.Mode -eq 'cloud') { Write-Host "  • 歌词服务器：$($p.Server)" }
-        Write-Host "  • 网易云 / QQ 请求：$(Request-Name $p.Request)（始终本地优先）"
+        if ($p.Mode -eq 'cloud') { Write-Host "  • 网易云 / QQ 请求：$(Request-Name $p.Request)" }
         switch ($p.Request) {
             'service' { Write-Host "  • 安装本地服务：$LocalUrl，登录时自动启动（需要时下载 / 编译 spot-lyric-server）" }
             'direct' { Write-Host "  • 让 Spotify 以 $DirectFlag 启动" }
@@ -771,7 +771,8 @@ switch ($Command) {
         Invoke-Restart $dir $changed $r.Stopped
         if ($plan.Mode -eq 'cloud') { Say '完成！在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页；旁边的小箭头可把当前歌词上传到服务器。' }
         else { Say '完成！纯本地模式：不连接任何远程服务器。在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页。' }
-        Say "网易云 / QQ 请求：$(Request-Name $plan.Request)（始终本地优先）。以后想更换方式，重新运行本脚本即可。"
+        if ($plan.Mode -eq 'cloud') { Say "网易云 / QQ 请求：$(Request-Name $plan.Request)。以后想更换方式，重新运行本脚本即可。" }
+        else { Say '以后想更换方式，重新运行本脚本即可。' }
     }
     'apply' {
         $dir = Get-SpotifyDir

@@ -32,8 +32,8 @@ Check 'one marked block' (([regex]::Matches((Index), 'spot-lyric:start')).Count 
 Check 'cloud mode baked in' ((Bundle).Contains("const PATCH_MODE = 'cloud'") -and (Bundle).Contains("const PATCH_REQUEST = 'server'"))
 $out = Run apply --yes --mode cloud --no-restart --spotify-path $dir
 Check 'second apply is a no-op' ($out -match '无需修改')
-$out = Run apply --yes --mode cloud --request service --no-restart --spotify-path $dir
-Check 'cloud mode with the local service' ((Bundle).Contains("const PATCH_REQUEST = 'service'"))
+$out = Run apply --yes --mode cloud --request direct --no-restart --spotify-path $dir
+Check 'cloud mode with direct requests' ((Bundle).Contains("const PATCH_REQUEST = 'direct'"))
 $out = Run apply --yes --mode local --no-restart --spotify-path $dir
 Check 'pure local build' ((Bundle).Contains("const PATCH_MODE = 'local'"))
 Check 'apply never fetches the local service' (-not (Test-Path (Join-Path $env:SPOT_LYRIC_DATA 'spot-lyric-server.exe')))

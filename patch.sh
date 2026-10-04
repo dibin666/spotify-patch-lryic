@@ -4,12 +4,11 @@
 # Windows: patch.cmd / patch.ps1 — same commands, options and guided steps.
 #
 # Usage modes (asked step by step, or --mode):
-#   cloud   lyrics server stores shared matches (default)
-#   local   pure local, NetEase / QQ through the local service (127.0.0.1:38917)
-#   direct  pure local, Spotify runs with --disable-web-security (Linux only)
-# How NetEase / QQ are requested on this machine (--request), also in cloud mode:
-#   service local service (spot-lyric-server: downloaded / built only when chosen)
-#   direct  --disable-web-security            server  only through the lyrics server relay
+#   cloud   lyrics server stores shared matches (default); NetEase / QQ requests (--request)
+#           go direct (--disable-web-security, Linux) or through the lyrics server relay
+#   local   pure local: the local service (spot-lyric-server on 127.0.0.1:38917,
+#           downloaded / built only for this mode) relays NetEase / QQ requests
+#   direct  pure local without the service: --disable-web-security (advanced, Linux only)
 # The plugin always prefers local paths: direct -> local service -> lyrics server.
 #
 # Portable to the bash 3.2 that ships with macOS: no readlink -f, getent,
@@ -64,18 +63,18 @@ Spot-Lyric for Spotify v${VERSION}（macOS / Linux；Windows 运行 patch.cmd，
   unhook       移除自动重新注入
 
 使用方式（--mode）:
-  cloud        云端服务器（默认）：服务器保存共享的匹配与歌词
-  local        纯本地 · 本地服务：不连接远程服务器，请求经 127.0.0.1:38917 的本地服务
-  direct       纯本地 · 直连：不连接远程服务器，以 --disable-web-security 启动 Spotify（不支持 macOS）
+  cloud        云端服务器（默认）：服务器保存共享的匹配与歌词；网易云 / QQ 请求见 --request
+  local        纯本地：不连接远程服务器，请求经本机 127.0.0.1:38917 的本地服务
+               （spot-lyric-server，仅此方式需要下载 / 编译）
+  direct       纯本地，不用本地服务而以 --disable-web-security 启动 Spotify（高级，不支持 macOS）
 
-网易云 / QQ 请求方式（--request，云端模式也可在本机请求；插件始终本地优先：直连 → 本地服务 → 歌词服务器）:
-  service      本地服务（spot-lyric-server，仅选择它时才下载 / 编译）
-  direct       直连（--disable-web-security，不支持 macOS）
-  server       不在本机请求，全部经歌词服务器转发（仅云端模式）
+云端模式下网易云 / QQ 的请求方式（--request；插件始终本地优先：直连 → 本地服务 → 歌词服务器）:
+  direct       直连：以 --disable-web-security 启动 Spotify，请求从本机发出（不支持 macOS）
+  server       经歌词服务器原样转发（macOS 默认）
 
 选项:
   --mode M             使用方式：cloud / local / direct（不指定时分步询问）
-  --request R          网易云 / QQ 请求方式：service / direct / server（不指定时分步询问）
+  --request R          云端模式的网易云 / QQ 请求方式：direct / server（不指定时分步询问）
   --server URL         歌词服务器地址（默认 ${DEFAULT_SERVER}）
   --local / --direct   等同 --mode local / --mode direct
   --spotify-path P     手动指定 Spotify 位置（Linux：含 Apps/xpui.spa 的目录；macOS：Spotify.app）
@@ -154,9 +153,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 COMMAND="${COMMAND:-install}"
+# --request is the cloud mode's choice; "service" means the pure local mode.
 case "$MODE:$REQUEST" in
-  local:direct|local:server) die "--mode local 只能配合 --request service（纯本地直连请用 --mode direct）" ;;
-  direct:service|direct:server) die "--mode direct 只能配合 --request direct（纯本地本地服务请用 --mode local）" ;;
+  :service|local:service) MODE=local; REQUEST="" ;;
+  cloud:service) die "本地服务只用于纯本地模式（--mode local）；云端模式的 --request 可选 direct / server" ;;
+  local:*?) die "纯本地模式（--mode local）使用本地服务，不需要 --request" ;;
+  direct:server) die "--mode direct 是不连接服务器的纯本地模式，不能配合 --request server" ;;
+  direct:direct) REQUEST="" ;;
 esac
 
 # ----------------------------------------------------------------- user ---
@@ -864,12 +867,13 @@ current_server() { printf '%s' "${SERVER:-${CFG_SERVER:-$DEFAULT_SERVER}}"; }
 # what is set up (a launcher with the direct switches from 1.2 --direct means direct).
 current_request() {
   case "$1" in local) echo service; return 0 ;; direct) echo direct; return 0 ;; esac
-  if [[ -n $REQUEST ]]; then echo "$REQUEST"; elif [[ -n $CFG_REQUEST ]]; then echo "$CFG_REQUEST"
-  elif service_installed; then echo service; elif direct_enabled; then echo direct; else echo server; fi
+  if [[ -n $REQUEST ]]; then echo "$REQUEST"
+  elif [[ $CFG_REQUEST == direct || $CFG_REQUEST == server ]]; then echo "$CFG_REQUEST"
+  elif direct_enabled; then echo direct; else echo server; fi
 }
-DIRECT_OFF=""; [[ $PLATFORM == macos ]] && DIRECT_OFF="macOS 不支持（无法给从 Dock / 启动台打开的 Spotify 加启动参数）"
-SERVICE_HINT="在 127.0.0.1:38917 运行一个后台小服务（spot-lyric-server，约 10 MB 内存），登录时自动启动；\n只有选择它时才下载（装有 Go 时从源码编译）这个程序，不改 Spotify 的启动方式"
-DIRECT_HINT="以 --disable-web-security 启动 Spotify，没有后台进程，不需要下载任何程序；\n会关闭 Spotify 内置浏览器的同源限制，修改应用菜单中的 Spotify 启动项"
+PURE_HINT="不连接任何远程服务器：在本机 127.0.0.1:38917 运行一个小服务（登录时自动启动）转发网易云 / QQ 请求；\n搜索、匹配、歌词下载都在本机进行，绑定的歌词只保存在本机（会下载或编译 spot-lyric-server，约 10 MB）"
+DIRECT_HINT="以 --disable-web-security 启动 Spotify，请求从本机直接发出，不需要下载任何程序；\n会关闭 Spotify 内置浏览器的同源限制，并修改应用菜单中的 Spotify 启动项"
+SERVER_HINT="Spotify 内置浏览器会拦截跨域请求，由歌词服务器原样转发（搜索和匹配仍在本机），什么都不用改"
 STEP=0
 next_step() { STEP=$((STEP + 1)); }
 
@@ -878,23 +882,19 @@ make_plan() {
   local current current_req
   P_MODE="$MODE"; P_SERVER="$(current_server)"
   [[ -z $P_MODE && ( -n $SERVER || $REQUEST == server ) ]] && P_MODE=cloud
-  current="$(current_mode)"; current_req="$(current_request "$current")"
-  [[ $current_req == direct && $PLATFORM == macos ]] && current_req=service
+  current="$(current_mode)"; current_req="$(current_request cloud)"
+  [[ $current_req == direct && $PLATFORM == macos ]] && current_req=server
   if [[ -z $P_MODE ]]; then
     next_step; choose "[$STEP]" "选择使用方式" "$([[ $current == cloud ]] && echo cloud || echo pure)" \
-      "cloud|云端服务器|歌词服务器保存「使用此歌词」和上传按钮提交的匹配，多台设备共享；\n下一步可选择是否在本机请求网易云 / QQ 音乐（始终本地优先）|" \
-      "pure|纯本地|不连接任何远程服务器：搜索、匹配、歌词下载都在本机进行，绑定的歌词只保存在本机|"
+      "cloud|云端服务器|歌词服务器保存「使用此歌词」和上传按钮提交的匹配，多台设备共享|" \
+      "pure|纯本地|$PURE_HINT|"
     if [[ $CHOICE == cloud ]]; then P_MODE=cloud
-    elif [[ -n $REQUEST ]]; then P_MODE="$([[ $REQUEST == direct ]] && echo direct || echo local)"
-    else
-      next_step; choose "[$STEP]" "纯本地：网易云 / QQ 音乐的请求怎么发出？（Spotify 内置浏览器会拦截跨域请求）" "$([[ $current_req == direct ]] && echo direct || echo local)" \
-        "local|本地服务|$SERVICE_HINT|" "direct|直连|$DIRECT_HINT|$DIRECT_OFF"
-      P_MODE="$CHOICE"
-    fi
+    elif [[ $REQUEST == direct || ( -z $REQUEST && $current == direct ) ]]; then P_MODE=direct   # kept only when asked for (--mode direct)
+    else P_MODE=local; fi
   fi
   case "$P_MODE" in
-    local) [[ -z $REQUEST || $REQUEST == service ]] || die "--mode local 只能配合 --request service（纯本地直连请用 --mode direct）"; P_REQ=service ;;
-    direct) [[ -z $REQUEST || $REQUEST == direct ]] || die "--mode direct 只能配合 --request direct（纯本地本地服务请用 --mode local）"; P_REQ=direct ;;
+    local) P_REQ=service ;;
+    direct) P_REQ=direct ;;
     cloud)
       if interactive && [[ -z $SERVER ]]; then
         printf '\n'; next_step
@@ -908,14 +908,14 @@ make_plan() {
         done
       fi
       if [[ -n $REQUEST ]]; then P_REQ="$REQUEST"
+      elif [[ $PLATFORM == macos ]]; then P_REQ=server   # no direct mode on macOS: nothing to choose
       else
-        next_step; choose "[$STEP]" "是否在本机请求网易云 / QQ 音乐？（插件始终本地优先：直连 → 本地服务 → 歌词服务器）" "$current_req" \
-          "service|本地服务|$SERVICE_HINT|" "direct|直连|$DIRECT_HINT|$DIRECT_OFF" \
-          "server|不在本机请求|全部经歌词服务器原样转发（搜索和匹配仍在本机），什么都不用安装|"
+        next_step; choose "[$STEP]" "网易云 / QQ 音乐的请求怎么发出？" "$current_req" \
+          "direct|直连|$DIRECT_HINT|" "server|经歌词服务器转发|$SERVER_HINT|"
         P_REQ="$CHOICE"
       fi ;;
   esac
-  [[ $P_REQ == direct && $PLATFORM == macos ]] && die "macOS 不支持直连（无法给从 Dock / 启动台打开的 Spotify 加启动参数），请使用本地服务（--request service / --mode local）"
+  [[ $P_REQ == direct && $PLATFORM == macos ]] && die "macOS 不支持直连（无法给从 Dock / 启动台打开的 Spotify 加启动参数）；云端模式请用 --request server，纯本地请用 --mode local"
   case "$HOOK" in
     on) P_HOOK=1 ;;
     off) P_HOOK=0 ;;
@@ -934,7 +934,7 @@ make_plan() {
     printf '\n%s\n' "$(paint 1 '即将执行：')"
     printf '  • 注入歌词插件 v%s（使用方式：%s）\n' "$VERSION" "$(mode_name "$P_MODE")"
     [[ $P_MODE == cloud ]] && printf '  • 歌词服务器：%s\n' "$P_SERVER"
-    printf '  • 网易云 / QQ 请求：%s（始终本地优先）\n' "$(request_name "$P_REQ")"
+    [[ $P_MODE == cloud ]] && printf '  • 网易云 / QQ 请求：%s\n' "$(request_name "$P_REQ")"
     case "$P_REQ" in
       service) printf '  • 安装本地服务：%s，登录时自动启动（需要时下载 / 编译 spot-lyric-server）\n' "$LOCAL_URL" ;;
       direct) printf '  • 让 Spotify 以 %s 启动\n' "$DIRECT_FLAG" ;;
@@ -976,7 +976,8 @@ case "$COMMAND" in
     restart_spotify "$changed"
     if [[ $P_MODE == cloud ]]; then say "完成！在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页；旁边的小箭头可把当前歌词上传到服务器。"
     else say "完成！纯本地模式：不连接任何远程服务器。在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页。"; fi
-    say "网易云 / QQ 请求：$(request_name "$P_REQ")（始终本地优先）。以后想更换方式，重新运行本脚本即可。"
+    if [[ $P_MODE == cloud ]]; then say "网易云 / QQ 请求：$(request_name "$P_REQ")。以后想更换方式，重新运行本脚本即可。"
+    else say "以后想更换方式，重新运行本脚本即可。"; fi
     ;;
   apply)
     need_spotify

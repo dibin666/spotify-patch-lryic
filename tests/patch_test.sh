@@ -112,8 +112,10 @@ if [[ -f "$SRC/win/Apps/xpui.spa" ]]; then
     check "ps1 second apply is a no-op" '[[ $out == *无需修改* ]]'
     run "${ps[@]}" -Server https://lyrics.example.com -NoRestart -SpotifyPath "$d" apply -y
     check "ps1 accepts the old -Server / -SpotifyPath style" '[[ $out == *已注入* ]] && unzip -p "$d/Apps/xpui.spa" spot-lyric/spot-lyric.js | grep -c "https://lyrics.example.com" >/dev/null'
-    run "${ps[@]}" apply --yes --mode cloud --request service --spotify-path "$d"
-    check "ps1 cloud mode with the local service" '[[ $(baked "$d/Apps/xpui.spa" cloud) -eq 1 && $(baked_request "$d/Apps/xpui.spa" service) -eq 1 ]]'
+    run "${ps[@]}" apply --yes --mode cloud --request direct --spotify-path "$d"
+    check "ps1 cloud mode with direct requests" '[[ $(baked "$d/Apps/xpui.spa" cloud) -eq 1 && $(baked_request "$d/Apps/xpui.spa" direct) -eq 1 ]]'
+    out="$("${ps[@]}" --mode cloud --request service --spotify-path /nonexistent 2>&1 || true)"
+    check "ps1: the local service is only for pure local" '[[ $out == *"本地服务只用于纯本地模式"* ]]'
     run "${ps[@]}" apply --yes --mode local --spotify-path "$d"
     check "ps1 pure local build" '[[ $(baked "$d/Apps/xpui.spa" local) -eq 1 ]]'
     run "${ps[@]}" status --spotify-path "$d"
@@ -133,7 +135,9 @@ check "patch.sh: no \$NAME directly before non-ASCII text" '[[ -z $bare ]] || { 
 out="$("$BASH_BIN" "$ROOT/patch.sh" --mode nope 2>&1 || true)"
 check "patch.sh rejects unknown modes" '[[ $out == *未知的使用方式* ]]'
 out="$("$BASH_BIN" "$ROOT/patch.sh" --mode local --request server -y --spotify-path /nonexistent 2>&1 || true)"
-check "patch.sh rejects pure local with server requests (before looking at Spotify)" '[[ $out == *"只能配合 --request service"* ]]'
+check "patch.sh rejects --request with pure local (before looking at Spotify)" '[[ $out == *"不需要 --request"* ]]'
+out="$("$BASH_BIN" "$ROOT/patch.sh" --mode cloud --request service -y --spotify-path /nonexistent 2>&1 || true)"
+check "patch.sh: the local service is only for pure local" '[[ $out == *"本地服务只用于纯本地模式"* ]]'
 out="$("$BASH_BIN" "$ROOT/patch.sh" -NoRestart -SpotifyPath /nonexistent apply 2>&1 || true)"
 check "patch.sh accepts the PowerShell option style" '[[ $out == *"指定位置不是 Spotify：/nonexistent"* ]]'
 echo "== cross-platform marker (cloud build)"
