@@ -385,7 +385,7 @@ start_spotify() {
   else
     local launcher=spotify flags=()
     command -v spotify >/dev/null 2>&1 || launcher="$SPOTIFY_DIR/spotify"
-    direct_enabled && flags=("$DIRECT_FLAG")
+    direct_enabled && flags=("$DIRECT_FLAG" "--user-data-dir=$DIRECT_PROFILE")
     if command -v setsid >/dev/null 2>&1; then as_user env DISPLAY="${DISPLAY:-:0}" setsid -f "$launcher" ${flags[@]+"${flags[@]}"} >/dev/null 2>&1 < /dev/null || warn "请手动启动 Spotify"
     else as_user env DISPLAY="${DISPLAY:-:0}" nohup "$launcher" ${flags[@]+"${flags[@]}"} >/dev/null 2>&1 < /dev/null & fi
   fi
@@ -394,11 +394,16 @@ start_spotify() {
 # --------------------------------------------------------------- direct ---
 # Spotify's renderer enforces CORS and NetEase / QQ send no CORS headers, so the
 # plugin can only reach them itself when Spotify runs with --disable-web-security
-# (CEF honours the switch). Opt-in: a per-user spotify.desktop overrides the
-# system launcher entry. Without it the lyrics server relays the requests.
+# (CEF honours the switch). Newer Chromium refuses it unless --user-data-dir is
+# also given a non-default path, so a symlink to Spotify's real profile directory
+# is used (same data, different path). Opt-in: a per-user spotify.desktop
+# overrides the system launcher entry. Without it the lyrics server relays the requests.
 DIRECT_FLAG=--disable-web-security
+SPOTIFY_PROFILE="${XDG_CONFIG_HOME:-$TARGET_HOME/.config}/spotify"
+DIRECT_PROFILE="${XDG_CONFIG_HOME:-$TARGET_HOME/.config}/spotify-direct"
+DIRECT_ARGS="$DIRECT_FLAG --user-data-dir=$DIRECT_PROFILE"
 DESKTOP_OVERRIDE="$TARGET_HOME/.local/share/applications/spotify.desktop"
-direct_enabled() { [[ $PLATFORM == linux && -f $DESKTOP_OVERRIDE ]] && grep -q '^X-Spot-Lyric=direct' "$DESKTOP_OVERRIDE" 2>/dev/null; }
+direct_enabled() { [[ $PLATFORM == linux && -f $DESKTOP_OVERRIDE ]] && grep -q '^X-Spot-Lyric=direct' "$DESKTOP_OVERRIDE" 2>/dev/null && grep -q -- '--user-data-dir=' "$DESKTOP_OVERRIDE" 2>/dev/null; }
 enable_direct() {
   if [[ $PLATFORM == macos ]]; then
     warn "macOS 无法给从 Dock / 启动台打开的 Spotify 固定启动参数：--direct 未启用，歌词请求将经服务器转发"
@@ -408,22 +413,24 @@ enable_direct() {
   for f in /usr/share/applications/spotify.desktop /usr/local/share/applications/spotify.desktop "$SPOTIFY_DIR/spotify.desktop"; do
     [[ -f $f ]] && { src="$f"; break; }
   done
-  as_user mkdir -p "$(dirname "$DESKTOP_OVERRIDE")"
+  as_user mkdir -p "$(dirname "$DESKTOP_OVERRIDE")" "$SPOTIFY_PROFILE"
+  [[ -e $DIRECT_PROFILE && ! -L $DIRECT_PROFILE ]] && die "$DIRECT_PROFILE 已存在且不是符号链接，请先移走它"
+  as_user ln -sfn "$SPOTIFY_PROFILE" "$DIRECT_PROFILE"
   {
     if [[ -n $src ]]; then
       # Add the switch to every Exec= line that does not have it yet.
-      sed -e "/^Exec=/{/$DIRECT_FLAG/!s/^Exec=\([^ ]*\)/Exec=\1 $DIRECT_FLAG/;}" -e '/^X-Spot-Lyric=/d' "$src"
+      sed -e "s| $DIRECT_FLAG||g" -e "s| --user-data-dir=$DIRECT_PROFILE||g" -e "/^Exec=/s|^Exec=\([^ ]*\)|Exec=\1 $DIRECT_ARGS|" -e '/^X-Spot-Lyric=/d' "$src"
     else
-      printf '[Desktop Entry]\nType=Application\nName=Spotify\nIcon=spotify-client\nExec=spotify %s %%U\nTerminal=false\nMimeType=x-scheme-handler/spotify;\nCategories=Audio;Music;Player;AudioVideo;\nStartupWMClass=spotify\n' "$DIRECT_FLAG"
+      printf '[Desktop Entry]\nType=Application\nName=Spotify\nIcon=spotify-client\nExec=spotify %s %%U\nTerminal=false\nMimeType=x-scheme-handler/spotify;\nCategories=Audio;Music;Player;AudioVideo;\nStartupWMClass=spotify\n' "$DIRECT_ARGS"
     fi
     printf 'X-Spot-Lyric=direct\n'
   } | as_user tee "$DESKTOP_OVERRIDE" >/dev/null
-  say "已启用本机直连：应用菜单中的 Spotify 将以 $DIRECT_FLAG 启动（$DESKTOP_OVERRIDE）"
-  say "其它启动方式（自建快捷方式、AppImage、开机自启）请自行加上 $DIRECT_FLAG；未加时自动改用服务器转发"
+  say "已启用本机直连：应用菜单中的 Spotify 将以 $DIRECT_ARGS 启动（$DESKTOP_OVERRIDE）"
+  say "其它启动方式（自建快捷方式、AppImage、开机自启）请自行加上 $DIRECT_ARGS；未加时自动改用服务器转发"
   warn "提示：该参数会关闭 Spotify 内置浏览器的同源限制，可用 ./patch.sh --no-direct 撤销"
 }
 disable_direct() {
-  if direct_enabled; then as_user rm -f "$DESKTOP_OVERRIDE"; say "已取消本机直连，歌词请求将经服务器转发"; fi
+  if [[ -f $DESKTOP_OVERRIDE ]] && grep -q '^X-Spot-Lyric=direct' "$DESKTOP_OVERRIDE" 2>/dev/null; then as_user rm -f "$DESKTOP_OVERRIDE"; [[ -L $DIRECT_PROFILE ]] && as_user rm -f "$DIRECT_PROFILE"; say "已取消本机直连，歌词请求将经服务器转发"; fi
   return 0
 }
 apply_direct() {

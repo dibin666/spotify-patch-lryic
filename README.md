@@ -69,7 +69,7 @@ patch.cmd hook        :: 可选：开机/登录时自动检查并重新注入
 Spotify 内置浏览器强制 CORS，而网易云 / QQ 音乐的接口不允许跨域读取，所以：
 
 - **默认**：插件先尝试直连，被拦截后把自己构造好的请求交给歌词服务器原样转发（仅白名单域名与接口），匹配仍在本机。
-- **`--direct`**：以 `--disable-web-security` 启动 Spotify，请求全部从本机发出，不经过服务器。该参数会关闭 Spotify 内置浏览器的同源限制；Linux 写入 `~/.local/share/applications/spotify.desktop`，Windows 修改 Spotify 快捷方式与开机自启项，macOS 不支持（自动使用转发）。从其它入口启动时未带参数也没关系，会自动改用转发。
+- **`--direct`**：以 `--disable-web-security --user-data-dir=<配置目录副本>` 启动 Spotify（新版 Chromium 要求同时指定非默认的 `--user-data-dir` 才允许关闭同源限制；Linux 用符号链接 `~/.config/spotify-direct` 指向原配置目录，登录状态不变；Windows 使用 `%LOCALAPPDATA%\Spotify\DirectProfile`，首次可能需要重新登录 / 重设插件选项），请求全部从本机发出，不经过服务器。该参数会关闭 Spotify 内置浏览器的同源限制；Linux 写入 `~/.local/share/applications/spotify.desktop`，Windows 修改 Spotify 快捷方式与开机自启项，macOS 不支持（自动使用转发）。从其它入口启动时未带参数也没关系，会自动改用转发。
 
 「歌词设置 > 歌词服务器 > 网络」显示当前方式，也可关闭服务器转发。
 

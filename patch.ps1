@@ -250,6 +250,9 @@ function Stop-Spotify {
 # Opt-in (-Direct): the switch is added to the Spotify shortcuts and to Spotify's
 # own autostart entry. Without it the lyrics server relays the requests.
 $DirectFlag = '--disable-web-security'
+# Newer Chromium refuses --disable-web-security unless --user-data-dir is a non-default path.
+$DirectProfile = Join-Path $(if ($env:LOCALAPPDATA) { $env:LOCALAPPDATA } else { $env:TEMP }) 'Spotify\DirectProfile'
+$DirectArgs = "$DirectFlag --user-data-dir=`"$DirectProfile`""
 $DirectMarker = Join-Path $DataDir 'direct'
 function Test-DirectMode { Test-Path -LiteralPath $DirectMarker }
 
@@ -262,13 +265,13 @@ function Get-SpotifyShortcuts {
 
 function Set-DirectMode([bool]$Enable) {
     if (-not $OnWindows) { return }
-    $flag = [regex]::Escape($DirectFlag)
+    $flag = '(?:' + [regex]::Escape($DirectFlag) + '|--user-data-dir="[^"]*DirectProfile")'
     $shell = New-Object -ComObject WScript.Shell
     foreach ($path in Get-SpotifyShortcuts) {
         try {
             $link = $shell.CreateShortcut($path)
             $arguments = (($link.Arguments -replace $flag, '') -replace '\s+', ' ').Trim()
-            if ($Enable) { $arguments = ($arguments + ' ' + $DirectFlag).Trim() }
+            if ($Enable) { $arguments = ($arguments + ' ' + $DirectArgs).Trim() }
             $link.Arguments = $arguments
             $link.Save()
         }
@@ -277,13 +280,13 @@ function Set-DirectMode([bool]$Enable) {
     $autostart = Get-ItemProperty -Path $RunKey -Name 'Spotify' -ErrorAction SilentlyContinue
     if ($autostart -and $autostart.Spotify) {
         $value = (($autostart.Spotify -replace (' ?' + $flag), '')).TrimEnd()
-        if ($Enable) { $value = "$value $DirectFlag" }
+        if ($Enable) { $value = "$value $DirectArgs" }
         Set-ItemProperty -Path $RunKey -Name 'Spotify' -Value $value
     }
     if ($Enable) {
         $null = New-Item -ItemType Directory -Force -Path $DataDir
         Set-Content -LiteralPath $DirectMarker -Value $DirectFlag -Encoding ASCII
-        Say "已启用本机直连：Spotify 快捷方式和开机自启将以 $DirectFlag 启动"
+        Say "已启用本机直连：Spotify 快捷方式和开机自启将以 $DirectArgs 启动"
         Warn '提示：该参数会关闭 Spotify 内置浏览器的同源限制，可用 patch.cmd -NoDirect 撤销；Spotify 自动更新重建快捷方式后会改用服务器转发'
     }
     else {
@@ -294,7 +297,7 @@ function Set-DirectMode([bool]$Enable) {
 
 function Start-Spotify([string]$Dir) {
     $exe = Join-Path $Dir 'Spotify.exe'
-    if (Test-DirectMode) { Start-Process -FilePath $exe -ArgumentList $DirectFlag } else { Start-Process -FilePath $exe }
+    if (Test-DirectMode) { Start-Process -FilePath $exe -ArgumentList $DirectArgs } else { Start-Process -FilePath $exe }
 }
 
 # --------------------------------------------------------- server ---
