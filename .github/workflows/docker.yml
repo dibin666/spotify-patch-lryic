@@ -23,7 +23,9 @@ jobs:
       - uses: actions/setup-go@v5
         with: { go-version: '1.24' }
       - run: cd server && go vet ./... && go test ./...
+      # The live test hits real NetEase / QQ APIs, which throttle datacenter addresses: run it locally.
       - run: node --test tests/core.test.mjs tests/server.test.mjs
+        env: { SPOT_LYRIC_OFFLINE: '1' }
 
   # amd64 and arm64 are built separately, each on a native runner.
   build:
