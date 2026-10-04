@@ -98,7 +98,7 @@
   const SETTINGS_KEY = 'spot-lyric:settings';
   const DEFAULTS = {
     preferred_provider: 'netease', spotify_first: false, prefetch: true, verify_lyrics: true, relay: true,
-    translation: true, word_sync: true, font_scale: 1, color_mode: 'cover', only_eligible: false,
+    translation: true, word_sync: true, mini_player: true, font_scale: 1, color_mode: 'cover', only_eligible: false,
     server_url: '', server_token: '',
   };
   const cleanServerUrl = url => String(url || '').trim().replace(/\/+$/, '');
@@ -337,6 +337,7 @@
       await this.store.open();
       this.view = new LyricsView(this);
       this.entry = new EntryButton(this);
+      this.mini = new MiniLyrics(this);
       this.playerAPI.getEvents().addListener('update', (event) => this.onState(event.data));
       this.platform.getHistory().listen(() => { if (this.open && Date.now() > this.ignoreNav) this.close(); });
       document.addEventListener('click', (event) => {
@@ -396,13 +397,14 @@
       const engineTrack = track && { uri: track.uri, title: track.title, artists: track.artists, album: track.album, duration_ms: track.duration_ms };
       if (!Core.trackEqual(this.currentTrack, engineTrack)) {
         this.currentTrack = engineTrack; this.trackInfo = track;
-        if (this.open || this.store.setting('prefetch')) this.engine.setTrack(engineTrack);
+        if (this.open || this.store.setting('prefetch') || this.store.setting('mini_player')) this.engine.setTrack(engineTrack);
         else this.pendingTrack = engineTrack;
         if (this.open) this.view.trackChanged();
+        if (this.mini) this.mini.trackChanged();
       }
       if (this.open) this.view.reschedule();
     }
-    onEngine() { if (this.open) this.view.engineChanged(); this.entry && this.entry.refresh(); }
+    onEngine() { if (this.open) this.view.engineChanged(); this.entry && this.entry.refresh(); this.mini && this.mini.render(); }
     /* Spotify lyrics (fallback source) -------------------------------- */
     async spotifyLyrics(track, signal) {
       const info = this.trackInfo && this.trackInfo.uri === track.uri ? this.trackInfo : null;
@@ -437,6 +439,7 @@
       if (this.open) return;
       this.closeOfficial();
       this.open = true;
+      this.mini.refresh();
       if (this.pendingTrack !== undefined) { this.engine.setTrack(this.pendingTrack); this.pendingTrack = undefined; }
       this.view.mount();
       this.entry.refresh();
@@ -456,6 +459,26 @@
       clearInterval(this.poll);
       this.view.unmount();
       this.entry.refresh();
+      this.mini.refresh();
+    }
+    /* Theme shared by the lyrics page and the sidebar mini view: background mode + colours. */
+    async theme() {
+      const engine = this.engine, info = this.trackInfo;
+      let mode = this.store.setting('color_mode');
+      if (!BACKGROUNDS[mode] && mode !== 'cover') mode = 'cover';
+      const cover = info && (info.imageLarge || info.image) ? (info.imageLarge || info.image).replace('spotify:image:', 'https://i.scdn.co/image/') : '';
+      const image = cover ? `url("${cover.replace(/["\\]/g, '')}")` : 'none';
+      let colors = BACKGROUNDS[mode];
+      if (mode === 'cover') {
+        /* Spotify's lyric colours (when available) are softened the same way. */
+        let hsl = engine.colors && cssToHsl(engine.colors.background);
+        if (!hsl && info) {
+          hsl = await this.coverColor(info.image || info.imageLarge);
+          if (this.trackInfo !== info || this.store.setting('color_mode') !== mode) return null;
+        }
+        colors = hsl ? softPalette(hsl) : BACKGROUNDS.neutral;
+      }
+      return { mode, image, colors };
     }
     /* Album colour, Spotify style ------------------------------------- */
     async coverColor(imageUri) {
@@ -635,6 +658,116 @@
     }
   }
 
+  /* Opening brackets (「 『 （ …) leave half an em blank at a line start, which makes those lines look
+   * indented. Lines that begin with one get `sl-hang` (see app.css) so every line aligns left. */
+  const HANG_RE = /^\s*[「『【〈《〔〖（［｛]/;
+  const hangClass = text => HANG_RE.test(text || '') ? ' sl-hang' : '';
+  function applyTheme(el, theme) {
+    el.dataset.bg = theme.mode;
+    if (theme.mode === 'blur') el.style.setProperty('--sl-cover', theme.image);
+    el.style.setProperty('--lyrics-color-background', theme.colors.background);
+    el.style.setProperty('--lyrics-color-inactive', theme.colors.inactive);
+    el.style.setProperty('--lyrics-color-active', theme.colors.active);
+  }
+
+  /* ------------------------------------------ right sidebar mini lyrics - */
+  /* A scaled-down lyrics view inside Spotify's "Now playing" sidebar, placed above the
+   * artist card. Colours, background, translation and font scale follow the main page. */
+  class MiniLyrics {
+    constructor(app) {
+      this.app = app;
+      this.lyricsRef = null; this.lines = []; this.els = []; this.active = -2; this.shown = null; this.timer = 0; this.pending = 0;
+      this.closeBtn = h('button', {
+        type: 'button', class: 'sl-mini-close', 'aria-label': '关闭迷你歌词', title: '关闭迷你歌词（可在歌词设置中重新开启）',
+        onclick: () => { app.store.set('mini_player', false); this.refresh(); if (app.view.panel) app.view.panel.renderBody(); },
+      }, svg(ICON.close, 12));
+      this.linesBox = h('div', { class: 'sl-mini-lines' });
+      this.scroller = h('div', { class: 'sl-mini-scroll' }, this.linesBox);
+      this.empty = h('div', { class: 'sl-mini-empty' });
+      this.el = h('section', { class: 'sl-mini', 'aria-label': '迷你歌词', 'data-testid': 'spot-lyric-mini' },
+        h('div', { class: 'sl-bg' }), this.scroller, this.empty, this.closeBtn);
+      this.linesBox.addEventListener('click', (event) => {
+        const line = event.target.closest('.sl-line');
+        const data = line && this.lines[+line.dataset.i];
+        if (data && this.seekable) app.seek(data.start_time_ms - app.engine.offset());
+      });
+      /* React rebuilds the sidebar freely; re-attach whenever we are dropped (coalesced). */
+      this.observer = new MutationObserver(() => {
+        if (this.pending || !this.enabled()) return;
+        this.pending = setTimeout(() => { this.pending = 0; if (this.enabled() && !this.inPlace()) this.attach(); }, 250);
+      });
+      this.observer.observe(document.body, { childList: true, subtree: true });
+      this.refresh();
+    }
+    /* Not shown while the full lyrics page is open: it would only repeat it. */
+    enabled() { return this.app.store.setting('mini_player') !== false && !this.app.open; }
+    anchor() {
+      const selectors = ['.main-nowPlayingView-section', '[data-testid="NPV_Panel_OpenDiv"] section', '.main-nowPlayingView-aboutArtistV2'];
+      for (const selector of selectors) {
+        for (const node of document.querySelectorAll(selector)) if (node !== this.el && !this.el.contains(node) && node.offsetParent !== null) return node;
+      }
+      return null;
+    }
+    inPlace() { const a = this.anchor(); return !!a && this.el.isConnected && this.el.nextElementSibling === a; }
+    attach() {
+      const anchor = this.anchor();
+      if (!anchor) { this.el.remove(); return; }
+      anchor.before(this.el);
+      this.update(true);
+    }
+    refresh() {
+      if (!this.enabled()) { this.el.remove(); clearInterval(this.timer); this.timer = 0; return; }
+      const app = this.app;
+      if (app.pendingTrack !== undefined) { app.engine.setTrack(app.pendingTrack); app.pendingTrack = undefined; }
+      if (!this.timer) this.timer = setInterval(() => { if (document.visibilityState === 'visible' && this.el.isConnected) this.update(false); }, 300);
+      this.attach();
+      this.lyricsRef = null;
+      this.render();
+    }
+    trackChanged() { this.lyricsRef = null; this.render(); }
+    render() {
+      if (!this.enabled()) return;
+      const app = this.app, engine = app.engine, lyrics = engine.lyrics;
+      app.theme().then(theme => { if (theme) applyTheme(this.el, theme); });
+      this.el.style.setProperty('--sl-scale', String(app.store.setting('font_scale') || 1));
+      const usable = Core.lyricsUsable(lyrics) && !!app.currentTrack;
+      this.empty.hidden = usable;
+      this.scroller.hidden = !usable;
+      if (!usable) {
+        this.lyricsRef = null; this.lines = []; this.els = [];
+        this.empty.textContent = !app.currentTrack ? '没有正在播放的歌曲' : engine.busy ? '正在加载歌词…' : engine.status === '纯音乐，没有歌词' ? '纯音乐，没有歌词' : '暂无歌词';
+        return;
+      }
+      const showTranslation = !!app.store.setting('translation');
+      if (this.lyricsRef === lyrics && this.shown === showTranslation) { this.update(false); return; }
+      this.lyricsRef = lyrics; this.shown = showTranslation;
+      this.lines = lyrics.lines;
+      this.synced = lyrics.sync_type !== 'unsynced';
+      this.seekable = this.synced && app.canSeek();
+      this.linesBox.classList.toggle('sl-seekable', this.seekable);
+      this.linesBox.classList.toggle('sl-static', !this.synced);
+      this.els = this.lines.map((line, i) => h('div', { class: 'sl-line' + (line.text ? '' : ' sl-empty'), 'data-i': i, dir: 'auto' },
+        h('div', { class: 'sl-text' + hangClass(line.text) }, line.text),
+        showTranslation && line.text && line.translated_text ? h('div', { class: 'sl-trans' + hangClass(line.translated_text) }, line.translated_text) : null));
+      this.linesBox.replaceChildren(...this.els);
+      this.active = -2;
+      this.scroller.scrollTop = 0;
+      this.update(true);
+    }
+    update(initial) {
+      if (!this.synced || !this.els.length || !this.el.isConnected || this.scroller.hidden) return;
+      const index = Core.lyricsIndex(this.app.engine.lyrics, this.app.position() + this.app.engine.offset());
+      if (index === this.active && !initial) return;
+      this.active = index;
+      this.els.forEach((el, i) => {
+        el.classList.toggle('sl-past', i < index); el.classList.toggle('sl-active', i === index); el.classList.toggle('sl-future', i > index);
+      });
+      const el = this.els[Math.max(index, 0)], port = this.scroller.clientHeight;
+      if (!el || !port) return;
+      this.scroller.scrollTo({ top: el.offsetTop - (port - el.offsetHeight) / 2, behavior: initial ? 'auto' : 'smooth' });
+    }
+  }
+
   /* ------------------------------------------------------ lyrics view - */
   class LyricsView {
     constructor(app) {
@@ -730,29 +863,8 @@
     nudge(delta) { this.app.engine.setOffset(this.app.engine.offset() - this.app.store.getInt('timing-offset-ms', 0) + delta, false); }
     /* Background modes: cover (soft cover colour), blur (blurred cover art), dark. */
     async applyColors() {
-      const app = this.app, engine = app.engine, info = app.trackInfo;
-      let mode = app.store.setting('color_mode');
-      if (!BACKGROUNDS[mode] && mode !== 'cover') mode = 'cover';
-      const cover = info && (info.imageLarge || info.image) ? (info.imageLarge || info.image).replace('spotify:image:', 'https://i.scdn.co/image/') : '';
-      this.page.dataset.bg = mode;
-      if (mode === 'blur') {
-        const image = cover ? `url("${cover.replace(/["\\]/g, '')}")` : 'none';
-        if (this.bgImage !== image) { this.bgImage = image; this.bg.style.setProperty('--sl-cover', image); }
-      }
-      let colors = BACKGROUNDS[mode];
-      if (mode === 'cover') {
-        /* Spotify's lyric colours (when available) are softened the same way. */
-        let hsl = engine.colors && cssToHsl(engine.colors.background);
-        if (!hsl && info) {
-          hsl = await app.coverColor(info.image || info.imageLarge);
-          if (app.trackInfo !== info || app.store.setting('color_mode') !== mode) return;
-        }
-        colors = hsl ? softPalette(hsl) : BACKGROUNDS.neutral;
-      }
-      const style = this.page.style;
-      style.setProperty('--lyrics-color-background', colors.background);
-      style.setProperty('--lyrics-color-inactive', colors.inactive);
-      style.setProperty('--lyrics-color-active', colors.active);
+      const theme = await this.app.theme();
+      if (theme) applyTheme(this.page, theme);
     }
     /* (Re)builds lines when the lyrics object changes; otherwise refreshes chrome. */
     render(force) {
@@ -813,8 +925,8 @@
       const fragment = document.createDocumentFragment();
       this.els = this.lines.map((line, i) => {
         const el = h('div', { class: 'sl-line' + (line.text ? '' : ' sl-empty'), 'data-i': i, dir: 'auto' },
-          h('div', { class: 'sl-text' }, line.text),
-          showTranslation && line.text && line.translated_text ? h('div', { class: 'sl-trans' }, line.translated_text) : null);
+          h('div', { class: 'sl-text' + hangClass(line.text) }, line.text),
+          showTranslation && line.text && line.translated_text ? h('div', { class: 'sl-trans' + hangClass(line.translated_text) }, line.translated_text) : null);
         fragment.append(el);
         return el;
       });
@@ -1182,8 +1294,7 @@
       /* The pure local variant offered here follows the patch (local service or direct). */
       const pureMode = BAKED_MODE === 'cloud' ? 'local' : BAKED_MODE;
       const modeRow = h('div', { class: 'sl-setting' },
-        h('span', { class: 'sl-setting-text' }, h('span', null, '使用方式'),
-          h('small', null, local ? '纯本地：不连接任何远程服务器，「使用此歌词」只保存在本机' : '云端：歌词服务器保存「使用此歌词」和上传的匹配，所有设备共享')),
+        h('span', { class: 'sl-setting-text' }, h('span', null, '使用方式')),
         h('div', { class: 'sl-segmented' }, ...[['cloud', '云端服务器'], [pureMode, '纯本地']].map(([value, text]) => h('button', {
           type: 'button', class: (value === 'cloud') !== local ? 'sl-on' : '',
           onclick: () => { if ((value === 'cloud') === local) { app.setMode(value); this.renderBody(); } },
@@ -1215,12 +1326,12 @@
       return h('div', { class: 'sl-settings' },
         h('h3', null, '歌词来源'),
         segmented('preferred_provider', '首选歌词源', [['netease', '网易云音乐'], ['qq', 'QQ 音乐']]),
-        toggle('spotify_first', '优先使用 Spotify 歌词', '默认先匹配第三方歌词，Spotify 歌词作为兜底'),
-        toggle('verify_lyrics', '歌词比对匹配', '歌名对不上（如罗马音 / 日文）时，用 Spotify 歌词核对同艺术家、同时长的候选，正文一致才自动采用', () => app.engine.track && app.engine.setTrack(app.engine.track, true)),
-        toggle('prefetch', '后台预加载', '切歌时立即匹配，打开歌词页无需等待'),
+        toggle('spotify_first', '优先使用 Spotify 歌词'),
+        toggle('prefetch', '后台预加载'),
         h('h3', null, '显示'),
-        toggle('translation', '显示译文', '在原文下方显示翻译'),
-        toggle('word_sync', '逐字高亮', '歌词带逐字时间时使用逐字效果'),
+        toggle('translation', '显示译文'),
+        toggle('word_sync', '逐字高亮'),
+        toggle('mini_player', '右侧栏迷你歌词', null, () => this.app.mini.refresh()),
         segmented('font_scale', '字号', [[0.8, '小'], [1, '标准'], [1.2, '大']]),
         segmented('color_mode', '背景', [['cover', '封面取色'], ['blur', '封面模糊'], ['dark', '深色']]),
         h('h3', null, '时间校准'),
@@ -1231,7 +1342,7 @@
         ...(local ? [] : [h('div', { class: 'sl-setting' }, h('span', { class: 'sl-setting-text' }, h('span', null, '服务器状态'), h('small', { class: serverState.ok ? 'sl-good-text' : serverState.ok === false ? 'sl-error' : '' }, serverLine)),
           h('button', { type: 'button', class: 'sl-btn sl-btn-ghost sl-btn-small', onclick: async () => { await checkServer(); this.renderBody(); } }, '检测')),
         h('div', { class: 'sl-setting sl-setting-column' },
-          h('span', { class: 'sl-setting-text' }, h('span', null, '服务器地址'), h('small', null, '搜索、匹配和歌词下载在本机进行；服务器只保存「使用此歌词」和播放栏上传按钮提交的匹配与歌词，供所有设备共享。可改为自己部署的服务器。')),
+          h('span', { class: 'sl-setting-text' }, h('span', null, '服务器地址')),
           this.serverInput, this.tokenInput,
           h('div', { class: 'sl-setting-actions' },
             h('button', { type: 'button', class: 'sl-btn sl-btn-ghost sl-btn-small', onclick: () => { this.serverInput.value = cleanServerUrl(DEFAULT_SERVER); this.tokenInput.value = ''; saveServer(); } }, '恢复默认'),
@@ -1240,11 +1351,11 @@
         ...localRows,
         h('div', { class: 'sl-setting' }, h('span', { class: 'sl-setting-text' }, h('span', null, '网易云 / QQ 请求'),
           h('small', null, netOrder), h('small', { class: netState.direct === true || netState.localCount ? 'sl-good-text' : '' }, netLine))),
-        local ? null : toggle('relay', '允许服务器转发', '直连和本地服务都不可用时，由歌词服务器原样转发网易云 / QQ 音乐请求（匹配仍在本机进行）'),
+        local ? null : toggle('relay', '允许服务器转发'),
         h('div', { class: 'sl-setting' }, h('span', { class: 'sl-setting-text' }, h('span', null, '本次会话'),
           h('small', null, `音乐平台 ${stats.requests} 次请求 · 本地服务 ${localStats.requests} 次 · 歌词服务器 ${cloudStats.requests} 次 · ${fmtBytes(stats.sent_bytes + stats.received_bytes + localStats.sent_bytes + localStats.received_bytes + cloudStats.sent_bytes + cloudStats.received_bytes)} · 缓存命中 ${stats.cache_hits} 次`)),
           h('button', { type: 'button', class: 'sl-btn sl-btn-ghost sl-btn-small', onclick: async () => { await store.cacheClear(); toast(local ? '本机缓存已清理，绑定的匹配与本地歌词已保留' : '本机缓存已清理，服务器上的匹配与本地歌词已保留'); } }, '清理缓存')),
-        h('p', { class: 'sl-about' }, `Spot-Lyric for Spotify v${VERSION} · 匹配：繁简归一、版本标签、多艺术家 / CV 别名、分级时长（参考 Lyricify、LDDC）；总时长差超过 3 秒或版本不同不自动绑定。`));
+        h('p', { class: 'sl-about' }, `Spot-Lyric for Spotify v${VERSION}`));
     }
   }
 
