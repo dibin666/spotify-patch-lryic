@@ -661,6 +661,7 @@
   /* Opening brackets (「 『 （ …) leave half an em blank at a line start, which makes those lines look
    * indented. Lines that begin with one get `sl-hang` (see app.css) so every line aligns left. */
   const HANG_RE = /^\s*[「『【〈《〔〖（［｛]/;
+  const CARD_HEADING = /^(关于艺人|提供者|队列中的下一首歌?|下一首|About the artist|Credits|Next in queue)$/i;
   const hangClass = text => HANG_RE.test(text || '') ? ' sl-hang' : '';
   function applyTheme(el, theme) {
     el.dataset.bg = theme.mode;
@@ -701,12 +702,19 @@
     }
     /* Not shown while the full lyrics page is open: it would only repeat it. */
     enabled() { return this.app.store.setting('mini_player') !== false && !this.app.open; }
+    /* Spotify's class names are hashed, so the first card under the cover ("关于艺人", "提供者", ...)
+     * is found by its heading text, then widened to the whole card. */
     anchor() {
-      const selectors = ['.main-nowPlayingView-section', '[data-testid="NPV_Panel_OpenDiv"] section', '.main-nowPlayingView-aboutArtistV2'];
-      for (const selector of selectors) {
-        for (const node of document.querySelectorAll(selector)) if (node !== this.el && !this.el.contains(node) && node.offsetParent !== null) return node;
+      const panel = document.querySelector('[data-testid="NPV_Panel_OpenDiv"]');
+      if (!panel) return null;
+      let card = null;
+      for (const node of panel.querySelectorAll('*')) {
+        if (node.childElementCount || this.el.contains(node) || !CARD_HEADING.test(node.textContent.trim())) continue;
+        card = node; break;
       }
-      return null;
+      if (!card) return null;
+      while (card.parentElement && card.parentElement !== panel && !(card.offsetHeight >= 100 && card.parentElement.childElementCount > 1)) card = card.parentElement;
+      return card;
     }
     inPlace() { const a = this.anchor(); return !!a && this.el.isConnected && this.el.nextElementSibling === a; }
     attach() {
