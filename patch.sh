@@ -4,10 +4,13 @@
 # Windows: patch.cmd / patch.ps1 — same commands, options and guided steps.
 #
 # Usage modes (asked step by step, or --mode):
-#   cloud   lyrics server stores shared matches and relays blocked requests (default)
-#   local   pure local: the local service (spot-lyric-server, downloaded / built only
-#           for this mode) relays on 127.0.0.1:38917
-#   direct  pure local: Spotify runs with --disable-web-security (Linux only)
+#   cloud   lyrics server stores shared matches (default)
+#   local   pure local, NetEase / QQ through the local service (127.0.0.1:38917)
+#   direct  pure local, Spotify runs with --disable-web-security (Linux only)
+# How NetEase / QQ are requested on this machine (--request), also in cloud mode:
+#   service local service (spot-lyric-server: downloaded / built only when chosen)
+#   direct  --disable-web-security            server  only through the lyrics server relay
+# The plugin always prefers local paths: direct -> local service -> lyrics server.
 #
 # Portable to the bash 3.2 that ships with macOS: no readlink -f, getent,
 # setsid, associative arrays, mapfile or ${x,,}.
@@ -41,8 +44,9 @@ case "${SPOT_LYRIC_PLATFORM:-$(uname -s)}" in
   Linux|linux)  PLATFORM=linux ;;
   *) echo "不支持的系统：$(uname -s)（Windows 请使用 patch.cmd）" >&2; exit 1 ;;
 esac
-APT_HOOK_DIR=/usr/local/share/spot-lyric-patch
-APT_HOOK_FILE=/etc/apt/apt.conf.d/99spot-lyric-patch
+# Overridable for tests (a sandbox must never see or change the real system hook).
+APT_HOOK_DIR="${SPOT_LYRIC_APT_HOOK_DIR:-/usr/local/share/spot-lyric-patch}"
+APT_HOOK_FILE="${SPOT_LYRIC_APT_HOOK_FILE:-/etc/apt/apt.conf.d/99spot-lyric-patch}"
 
 usage() {
   cat <<USAGE
@@ -60,12 +64,18 @@ Spot-Lyric for Spotify v${VERSION}（macOS / Linux；Windows 运行 patch.cmd，
   unhook       移除自动重新注入
 
 使用方式（--mode）:
-  cloud        云端服务器（默认）：服务器保存共享的匹配与歌词，本机无法直连时转发请求
-  local        纯本地 · 本地服务：127.0.0.1:38917 的后台小服务转发请求（仅此方式需要下载 / 编译它）
-  direct       纯本地 · 直连：以 --disable-web-security 启动 Spotify，无后台进程（不支持 macOS）
+  cloud        云端服务器（默认）：服务器保存共享的匹配与歌词
+  local        纯本地 · 本地服务：不连接远程服务器，请求经 127.0.0.1:38917 的本地服务
+  direct       纯本地 · 直连：不连接远程服务器，以 --disable-web-security 启动 Spotify（不支持 macOS）
+
+网易云 / QQ 请求方式（--request，云端模式也可在本机请求；插件始终本地优先：直连 → 本地服务 → 歌词服务器）:
+  service      本地服务（spot-lyric-server，仅选择它时才下载 / 编译）
+  direct       直连（--disable-web-security，不支持 macOS）
+  server       不在本机请求，全部经歌词服务器转发（仅云端模式）
 
 选项:
   --mode M             使用方式：cloud / local / direct（不指定时分步询问）
+  --request R          网易云 / QQ 请求方式：service / direct / server（不指定时分步询问）
   --server URL         歌词服务器地址（默认 ${DEFAULT_SERVER}）
   --local / --direct   等同 --mode local / --mode direct
   --spotify-path P     手动指定 Spotify 位置（Linux：含 Apps/xpui.spa 的目录；macOS：Spotify.app）
@@ -87,7 +97,7 @@ die()  { printf '%s %s\n' "$(paint '1;31' '[spot-lyric]')" "$*" >&2; exit 1; }
 
 # -------------------------------------------------------------- options ---
 # Long options may be written --name, -name or PowerShell style (-Server, -NoRestart).
-COMMAND=""; MODE=""; SERVER=""; SPOTIFY_PATH="${SPOTIFY_PATH:-}"; RESTART=auto; HOOK=""; YES=0
+COMMAND=""; MODE=""; REQUEST=""; SERVER=""; SPOTIFY_PATH="${SPOTIFY_PATH:-}"; RESTART=auto; HOOK=""; YES=0
 INTERNAL_APPS=""
 SERVER_RE='^https?://[A-Za-z0-9._~:/-]+$'
 while [[ $# -gt 0 ]]; do
@@ -116,12 +126,21 @@ while [[ $# -gt 0 ]]; do
         direct) MODE=direct ;;
         *) die "未知的使用方式：${value}（cloud / local / direct）" ;;
       esac ;;
+    request)
+      take "$@"; [[ $has_value == 1 ]] || shift
+      case "$(printf '%s' "$value" | tr 'A-Z' 'a-z')" in
+        service|local) REQUEST=service ;;
+        direct) REQUEST=direct ;;
+        server|relay|remote|none) REQUEST=server ;;
+        *) die "未知的请求方式：${value}（service / direct / server）" ;;
+      esac ;;
     server)
       take "$@"; [[ $has_value == 1 ]] || shift
       SERVER="${value%/}"
       [[ $SERVER =~ $SERVER_RE ]] || die "歌词服务器地址无效：${SERVER}（例如 https://lyrics.example.com）" ;;
     spotifypath) take "$@"; [[ $has_value == 1 ]] || shift; SPOTIFY_PATH="$value" ;;
-    cloud|nodirect) MODE=cloud ;;
+    cloud) MODE=cloud ;;
+    nodirect) REQUEST=server ;;
     local) MODE=local ;;
     direct) MODE=direct ;;
     restart) RESTART=yes ;;
@@ -135,6 +154,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 COMMAND="${COMMAND:-install}"
+case "$MODE:$REQUEST" in
+  local:direct|local:server) die "--mode local 只能配合 --request service（纯本地直连请用 --mode direct）" ;;
+  direct:service|direct:server) die "--mode direct 只能配合 --request direct（纯本地本地服务请用 --mode local）" ;;
+esac
 
 # ----------------------------------------------------------------- user ---
 # User-level pieces (config, local service, launcher entries, Spotify restart) belong to
@@ -182,18 +205,21 @@ else
 fi
 [[ -n ${SPOT_LYRIC_DATA:-} ]] && DATA_DIR="$SPOT_LYRIC_DATA"
 CONFIG_FILE="$DATA_DIR/config"
-CFG_MODE=""; CFG_SERVER=""
+CFG_MODE=""; CFG_SERVER=""; CFG_REQUEST=""
 if [[ -f $CONFIG_FILE ]]; then
   CFG_MODE="$(sed -n 's/^mode=//p' "$CONFIG_FILE" | head -n1)"
   CFG_SERVER="$(sed -n 's/^server=//p' "$CONFIG_FILE" | head -n1)"
+  CFG_REQUEST="$(sed -n 's/^request=//p' "$CONFIG_FILE" | head -n1)"
   case "$CFG_MODE" in cloud|local|direct) ;; *) CFG_MODE="" ;; esac
+  case "$CFG_REQUEST" in service|direct|server) ;; *) CFG_REQUEST="" ;; esac
   [[ $CFG_SERVER =~ $SERVER_RE ]] || CFG_SERVER=""
 fi
-save_config() {  # save_config MODE SERVER
+save_config() {  # save_config MODE SERVER REQUEST
   as_user mkdir -p "$DATA_DIR"
-  { printf 'mode=%s\n' "$1"; [[ $2 == "$DEFAULT_SERVER" ]] || printf 'server=%s\n' "$2"; } | as_user tee "$CONFIG_FILE" >/dev/null
+  { printf 'mode=%s\nrequest=%s\n' "$1" "$3"; [[ $2 == "$DEFAULT_SERVER" ]] || printf 'server=%s\n' "$2"; } | as_user tee "$CONFIG_FILE" >/dev/null
 }
 mode_name() { case "$1" in cloud) echo "云端服务器" ;; local) echo "纯本地 · 本地服务" ;; direct) echo "纯本地 · 直连" ;; esac; }
+request_name() { case "$1" in service) echo "本地服务" ;; direct) echo "直连" ;; server) echo "经歌词服务器转发" ;; esac; }
 
 # --------------------------------------------------------------- detect ---
 # Sets SPOTIFY_DIR (install / .app root) and APPS (directory holding xpui.spa).
@@ -257,7 +283,7 @@ spotify_version() {
 
 # ---------------------------------------------------------------- build ---
 # The usage mode and both addresses are baked into the plugin.
-build_bundle() {  # build_bundle OUT_DIR MODE SERVER
+build_bundle() {  # build_bundle OUT_DIR MODE SERVER REQUEST
   local out="$1"
   mkdir -p "$out"
   {
@@ -265,7 +291,7 @@ build_bundle() {  # build_bundle OUT_DIR MODE SERVER
     cat "$ROOT/src/core.js"
     printf '\n'
     sed -e "s/__SPOT_LYRIC_VERSION__/$VERSION/g" -e "s|__SPOT_LYRIC_SERVER__|$3|g" \
-        -e "s/__SPOT_LYRIC_MODE__/$2/g" -e "s|__SPOT_LYRIC_LOCAL__|$LOCAL_URL|g" "$ROOT/src/app.js"
+        -e "s/__SPOT_LYRIC_MODE__/$2/g" -e "s/__SPOT_LYRIC_REQUEST__/$4/g" -e "s|__SPOT_LYRIC_LOCAL__|$LOCAL_URL|g" "$ROOT/src/app.js"
   } > "$out/spot-lyric.js"
   cp "$ROOT/src/app.css" "$out/spot-lyric.css"
 }
@@ -481,11 +507,11 @@ macos_permission_hint() {
 }
 
 PATCH_CHANGED=0
-do_apply() {  # do_apply MODE SERVER
+do_apply() {  # do_apply MODE SERVER REQUEST
   local tmp result
   [[ $SPOTIFY_DIR == /snap/* ]] && die "Snap 版 Spotify 是只读文件系统，无法注入。请改用 deb 或 flatpak 版本。"
   tmp="$(mktemp -d)"
-  build_bundle "$tmp" "$1" "$2"
+  build_bundle "$tmp" "$1" "$2" "$3"
   if ! result="$(run_patcher patch "$tmp/spot-lyric.js" "$tmp/spot-lyric.css" 2>&1)"; then
     rm -rf "$tmp"
     [[ $PLATFORM == macos && $result == *"ermitted"* ]] && macos_permission_hint
@@ -728,12 +754,12 @@ remove_service() {
 }
 
 # ----------------------------------------------------------------- hook ---
-hook_supported() { [[ $PLATFORM == macos || -d /etc/apt/apt.conf.d ]]; }
+hook_supported() { [[ $PLATFORM == macos || -d $(dirname "$APT_HOOK_FILE") ]]; }
 hook_installed() {
   if [[ $PLATFORM == macos ]]; then [[ -f "$AGENT_DIR/$REAPPLY_LABEL.plist" ]]; else [[ -e $APT_HOOK_FILE ]]; fi
 }
-install_hook() {  # install_hook MODE SERVER
-  local mode="$1" server="$2"
+install_hook() {  # install_hook MODE SERVER REQUEST
+  local mode="$1" server="$2" request="$3"
   if [[ $PLATFORM == macos ]]; then
     local dir="$DATA_DIR/patcher" plist="$AGENT_DIR/$REAPPLY_LABEL.plist"
     as_user mkdir -p "$dir" "$AGENT_DIR" "$TARGET_HOME/Library/Logs"
@@ -748,7 +774,7 @@ install_hook() {  # install_hook MODE SERVER
   <key>Label</key><string>$REAPPLY_LABEL</string>
   <key>ProgramArguments</key>
   <array><string>/bin/bash</string><string>$dir/patch.sh</string><string>apply</string><string>--yes</string><string>--quiet</string>
-    <string>--no-restart</string><string>--mode</string><string>$mode</string><string>--server</string><string>$server</string>
+    <string>--no-restart</string><string>--mode</string><string>$mode</string><string>--request</string><string>$request</string><string>--server</string><string>$server</string>
     <string>--spotify-path</string><string>$SPOTIFY_DIR</string></array>
   <key>RunAtLoad</key><true/>
   <key>WatchPaths</key><array><string>$APPS/xpui.spa</string></array>
@@ -768,7 +794,7 @@ PLIST
   privileged mkdir -p "$APT_HOOK_DIR"
   privileged cp -r "$ROOT/patch.sh" "$ROOT/VERSION" "$ROOT/src" "$ROOT/tools" "$APT_HOOK_DIR/"
   privileged chmod -R a+rX "$APT_HOOK_DIR"
-  printf '%s\n' "DPkg::Post-Invoke { \"if [ -x $APT_HOOK_DIR/patch.sh ] && [ -d '$APPS' ]; then $APT_HOOK_DIR/patch.sh apply --yes --quiet --no-restart --mode $mode --server $server --spotify-path '$SPOTIFY_DIR' || true; fi\"; };" \
+  printf '%s\n' "DPkg::Post-Invoke { \"if [ -x $APT_HOOK_DIR/patch.sh ] && [ -d '$APPS' ]; then $APT_HOOK_DIR/patch.sh apply --yes --quiet --no-restart --mode $mode --request $request --server $server --spotify-path '$SPOTIFY_DIR' || true; fi\"; };" \
     | privileged tee "$APT_HOOK_FILE" >/dev/null
   say "已安装 apt 钩子：${APT_HOOK_FILE}（spotify-client 升级后自动重新注入）"
 }
@@ -832,47 +858,64 @@ confirm() {  # confirm QUESTION DEFAULT(y/n) -> status
 }
 
 # ---------------------------------------------------------------- plan ---
-# Mode in use when nothing was recorded. Before 1.3 there was no pure local mode
-# (--direct only sped up the cloud mode), so a direct launcher still means cloud.
-current_mode() {
-  if [[ -n $CFG_MODE ]]; then echo "$CFG_MODE"; elif service_installed; then echo local; else echo cloud; fi
-}
+current_mode() { echo "${CFG_MODE:-cloud}"; }
 current_server() { printf '%s' "${SERVER:-${CFG_SERVER:-$DEFAULT_SERVER}}"; }
+# Pure local modes imply their request method. Cloud: the option, the recorded choice, or
+# what is set up (a launcher with the direct switches from 1.2 --direct means direct).
+current_request() {
+  case "$1" in local) echo service; return 0 ;; direct) echo direct; return 0 ;; esac
+  if [[ -n $REQUEST ]]; then echo "$REQUEST"; elif [[ -n $CFG_REQUEST ]]; then echo "$CFG_REQUEST"
+  elif service_installed; then echo service; elif direct_enabled; then echo direct; else echo server; fi
+}
+DIRECT_OFF=""; [[ $PLATFORM == macos ]] && DIRECT_OFF="macOS 不支持（无法给从 Dock / 启动台打开的 Spotify 加启动参数）"
+SERVICE_HINT="在 127.0.0.1:38917 运行一个后台小服务（spot-lyric-server，约 10 MB 内存），登录时自动启动；\n只有选择它时才下载（装有 Go 时从源码编译）这个程序，不改 Spotify 的启动方式"
+DIRECT_HINT="以 --disable-web-security 启动 Spotify，没有后台进程，不需要下载任何程序；\n会关闭 Spotify 内置浏览器的同源限制，修改应用菜单中的 Spotify 启动项"
+STEP=0
+next_step() { STEP=$((STEP + 1)); }
 
-P_MODE=""; P_SERVER=""; P_HOOK=0
+P_MODE=""; P_REQ=""; P_SERVER=""; P_HOOK=0
 make_plan() {
-  local current asked=0 direct_off="" direct_hint
+  local current current_req
   P_MODE="$MODE"; P_SERVER="$(current_server)"
-  [[ -n $SERVER && -z $P_MODE ]] && P_MODE=cloud
-  current="$(current_mode)"
-  [[ $current == direct && $PLATFORM == macos ]] && current=local
+  [[ -z $P_MODE && ( -n $SERVER || $REQUEST == server ) ]] && P_MODE=cloud
+  current="$(current_mode)"; current_req="$(current_request "$current")"
+  [[ $current_req == direct && $PLATFORM == macos ]] && current_req=service
   if [[ -z $P_MODE ]]; then
-    choose "[1/3]" "选择使用方式" "$([[ $current == cloud ]] && echo cloud || echo pure)" \
-      "cloud|云端服务器|歌词服务器保存「使用此歌词」和上传按钮提交的匹配，多台设备共享；\n本机无法直连网易云 / QQ 音乐时由服务器原样转发请求（搜索和匹配仍在本机）|" \
+    next_step; choose "[$STEP]" "选择使用方式" "$([[ $current == cloud ]] && echo cloud || echo pure)" \
+      "cloud|云端服务器|歌词服务器保存「使用此歌词」和上传按钮提交的匹配，多台设备共享；\n下一步可选择是否在本机请求网易云 / QQ 音乐（始终本地优先）|" \
       "pure|纯本地|不连接任何远程服务器：搜索、匹配、歌词下载都在本机进行，绑定的歌词只保存在本机|"
     if [[ $CHOICE == cloud ]]; then P_MODE=cloud
+    elif [[ -n $REQUEST ]]; then P_MODE="$([[ $REQUEST == direct ]] && echo direct || echo local)"
     else
-      [[ $PLATFORM == macos ]] && direct_off="macOS 不支持（无法给从 Dock / 启动台打开的 Spotify 加启动参数）"
-      direct_hint="以 --disable-web-security 启动 Spotify，没有后台进程，不需要下载任何程序；\n会关闭 Spotify 内置浏览器的同源限制，修改应用菜单中的 Spotify 启动项"
-      choose "[2/3]" "纯本地：网易云 / QQ 音乐的请求怎么发出？（Spotify 内置浏览器会拦截跨域请求）" "$([[ $current == cloud ]] && echo local || echo "$current")" \
-        "local|本地服务|在 127.0.0.1:38917 运行一个后台小服务（spot-lyric-server，约 10 MB 内存），登录时自动启动；\n仅此方式需要下载（装有 Go 时从源码编译）这个程序，不改 Spotify 的启动方式|" \
-        "direct|直连|$direct_hint|$direct_off"
+      next_step; choose "[$STEP]" "纯本地：网易云 / QQ 音乐的请求怎么发出？（Spotify 内置浏览器会拦截跨域请求）" "$([[ $current_req == direct ]] && echo direct || echo local)" \
+        "local|本地服务|$SERVICE_HINT|" "direct|直连|$DIRECT_HINT|$DIRECT_OFF"
       P_MODE="$CHOICE"
     fi
-    interactive && asked=1
   fi
-  [[ $P_MODE == direct && $PLATFORM == macos ]] && die "macOS 不支持直连（无法给从 Dock / 启动台打开的 Spotify 加启动参数），请使用 --mode local"
-  if [[ $P_MODE == cloud && $asked == 1 && -z $SERVER ]]; then
-    printf '\n'
-    while :; do
-      printf '%s 歌词服务器地址（回车使用默认，也可以填自建服务器） [%s]: ' "$(paint '1;36' '[2/3]')" "$P_SERVER"
-      read_line || break
-      [[ -z $LINE ]] && break
-      LINE="${LINE%/}"
-      if [[ $LINE =~ $SERVER_RE ]]; then P_SERVER="$LINE"; break; fi
-      printf '%s\n' "$(paint 33 '地址无效，例如 https://lyrics.example.com')"
-    done
-  fi
+  case "$P_MODE" in
+    local) [[ -z $REQUEST || $REQUEST == service ]] || die "--mode local 只能配合 --request service（纯本地直连请用 --mode direct）"; P_REQ=service ;;
+    direct) [[ -z $REQUEST || $REQUEST == direct ]] || die "--mode direct 只能配合 --request direct（纯本地本地服务请用 --mode local）"; P_REQ=direct ;;
+    cloud)
+      if interactive && [[ -z $SERVER ]]; then
+        printf '\n'; next_step
+        while :; do
+          printf '%s 歌词服务器地址（回车使用默认，也可以填自建服务器） [%s]: ' "$(paint '1;36' "[$STEP]")" "$P_SERVER"
+          read_line || break
+          [[ -z $LINE ]] && break
+          LINE="${LINE%/}"
+          if [[ $LINE =~ $SERVER_RE ]]; then P_SERVER="$LINE"; break; fi
+          printf '%s\n' "$(paint 33 '地址无效，例如 https://lyrics.example.com')"
+        done
+      fi
+      if [[ -n $REQUEST ]]; then P_REQ="$REQUEST"
+      else
+        next_step; choose "[$STEP]" "是否在本机请求网易云 / QQ 音乐？（插件始终本地优先：直连 → 本地服务 → 歌词服务器）" "$current_req" \
+          "service|本地服务|$SERVICE_HINT|" "direct|直连|$DIRECT_HINT|$DIRECT_OFF" \
+          "server|不在本机请求|全部经歌词服务器原样转发（搜索和匹配仍在本机），什么都不用安装|"
+        P_REQ="$CHOICE"
+      fi ;;
+  esac
+  [[ $P_REQ == direct && $PLATFORM == macos ]] && die "macOS 不支持直连（无法给从 Dock / 启动台打开的 Spotify 加启动参数），请使用本地服务（--request service / --mode local）"
   case "$HOOK" in
     on) P_HOOK=1 ;;
     off) P_HOOK=0 ;;
@@ -880,8 +923,9 @@ make_plan() {
       P_HOOK=0
       if hook_supported; then
         if interactive; then
-          if [[ $PLATFORM == macos ]]; then printf '\n%s %s\n' "$(paint '1;36' '[3/3]')" "$(paint 1 'Spotify 自动更新后重新注入插件？（LaunchAgent，登录时和 Spotify 更新后检查）')"
-          else printf '\n%s %s\n' "$(paint '1;36' '[3/3]')" "$(paint 1 'Spotify 自动更新后重新注入插件？（apt 钩子，spotify-client 升级后执行）')"; fi
+          next_step
+          if [[ $PLATFORM == macos ]]; then printf '\n%s %s\n' "$(paint '1;36' "[$STEP]")" "$(paint 1 'Spotify 自动更新后重新注入插件？（LaunchAgent，登录时和 Spotify 更新后检查）')"
+          else printf '\n%s %s\n' "$(paint '1;36' "[$STEP]")" "$(paint 1 'Spotify 自动更新后重新注入插件？（apt 钩子，spotify-client 升级后执行）')"; fi
           confirm "安装自动重新注入" y && P_HOOK=1
         elif hook_installed; then P_HOOK=1; fi
       fi ;;
@@ -889,13 +933,14 @@ make_plan() {
   if interactive; then
     printf '\n%s\n' "$(paint 1 '即将执行：')"
     printf '  • 注入歌词插件 v%s（使用方式：%s）\n' "$VERSION" "$(mode_name "$P_MODE")"
-    case "$P_MODE" in
-      cloud) printf '  • 歌词服务器：%s\n' "$P_SERVER" ;;
-      local) printf '  • 安装本地服务：%s，登录时自动启动（需要时下载 / 编译 spot-lyric-server）\n' "$LOCAL_URL" ;;
+    [[ $P_MODE == cloud ]] && printf '  • 歌词服务器：%s\n' "$P_SERVER"
+    printf '  • 网易云 / QQ 请求：%s（始终本地优先）\n' "$(request_name "$P_REQ")"
+    case "$P_REQ" in
+      service) printf '  • 安装本地服务：%s，登录时自动启动（需要时下载 / 编译 spot-lyric-server）\n' "$LOCAL_URL" ;;
       direct) printf '  • 让 Spotify 以 %s 启动\n' "$DIRECT_FLAG" ;;
     esac
-    [[ $P_MODE != direct ]] && direct_enabled && printf '  • 取消 Spotify 的直连启动参数（%s）\n' "$DIRECT_FLAG"
-    [[ $P_MODE != local ]] && service_installed && printf '  • 停止并移除本地服务\n'
+    [[ $P_REQ != direct ]] && direct_enabled && printf '  • 取消 Spotify 的直连启动参数（%s）\n' "$DIRECT_FLAG"
+    [[ $P_REQ != service ]] && service_installed && printf '  • 停止并移除本地服务\n'
     if [[ $P_HOOK == 1 ]]; then printf '  • 安装自动重新注入\n'; elif hook_installed; then printf '  • 移除自动重新注入\n'; fi
     printf '\n'
     confirm "继续" y || die "已取消，没有做任何修改"
@@ -919,23 +964,24 @@ case "$COMMAND" in
     header; need_spotify; show_spotify
     make_plan
     remove_legacy_proxy
-    do_apply "$P_MODE" "$P_SERVER"
+    do_apply "$P_MODE" "$P_SERVER" "$P_REQ"
     changed=$PATCH_CHANGED
-    case "$P_MODE" in
-      cloud) remove_service; direct_enabled && { disable_direct; changed=1; } ;;
+    case "$P_REQ" in
+      service) direct_enabled && { disable_direct; changed=1; }; install_service ;;
       direct) remove_service; direct_enabled || changed=1; enable_direct ;;
-      local) direct_enabled && { disable_direct; changed=1; }; install_service ;;
+      server) remove_service; direct_enabled && { disable_direct; changed=1; } ;;
     esac
-    if [[ $P_HOOK == 1 ]]; then install_hook "$P_MODE" "$P_SERVER"; elif hook_installed; then remove_hook; fi
-    save_config "$P_MODE" "$P_SERVER"
+    if [[ $P_HOOK == 1 ]]; then install_hook "$P_MODE" "$P_SERVER" "$P_REQ"; elif hook_installed; then remove_hook; fi
+    save_config "$P_MODE" "$P_SERVER" "$P_REQ"
     restart_spotify "$changed"
     if [[ $P_MODE == cloud ]]; then say "完成！在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页；旁边的小箭头可把当前歌词上传到服务器。"
     else say "完成！纯本地模式：不连接任何远程服务器。在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页。"; fi
-    say "以后想更换使用方式，重新运行本脚本即可。"
+    say "网易云 / QQ 请求：$(request_name "$P_REQ")（始终本地优先）。以后想更换方式，重新运行本脚本即可。"
     ;;
   apply)
     need_spotify
-    do_apply "${MODE:-$(current_mode)}" "$(current_server)"
+    mode="${MODE:-$(current_mode)}"
+    do_apply "$mode" "$(current_server)" "$(current_request "$mode")"
     restart_spotify "$PATCH_CHANGED"
     ;;
   restore|uninstall)
@@ -958,16 +1004,18 @@ case "$COMMAND" in
     echo "插件版本：v$VERSION"
     mode="$(current_mode)"
     echo "使用方式：$(mode_name "$mode")"
+    req="$(current_request "$mode")"
+    echo "网易云 / QQ 请求：$(request_name "$req")（始终本地优先：直连 → 本地服务$([[ $mode == cloud ]] && echo ' → 歌词服务器')）"
     if [[ $mode == cloud ]]; then
       v="$(http_get "$(current_server)/health" | json_version)"
       if [[ -n $v ]]; then echo "歌词服务器：运行正常 v$v · $(current_server)"; else echo "歌词服务器：无法连接 $(current_server)"; fi
     fi
     v="$(local_health)"
     if [[ -n $v ]]; then echo "本地服务：运行中 v$v · $LOCAL_URL"
-    elif service_installed || [[ $mode == local ]]; then echo "本地服务：未运行（${LOCAL_URL}）"; fi
+    elif service_installed || [[ $req == service ]]; then echo "本地服务：未运行（${LOCAL_URL}）"; fi
     if [[ $PLATFORM == linux ]]; then direct_enabled && echo "直连启动参数：已启用（${DIRECT_FLAG}）" || echo "直连启动参数：未启用"; fi
     if ! hook_supported; then echo "自动重新注入：不可用"; elif hook_installed; then echo "自动重新注入：已安装"; else echo "自动重新注入：未安装"; fi
     ;;
-  hook) need_spotify; install_hook "${MODE:-$(current_mode)}" "$(current_server)" ;;
+  hook) need_spotify; mode="${MODE:-$(current_mode)}"; install_hook "$mode" "$(current_server)" "$(current_request "$mode")" ;;
   unhook) remove_hook ;;
 esac

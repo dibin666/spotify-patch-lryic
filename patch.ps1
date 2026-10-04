@@ -6,10 +6,13 @@
 
 .DESCRIPTION
   Usage modes (asked step by step, or --mode):
-    cloud   lyrics server stores shared matches and relays blocked requests (default)
-    local   pure local: the local service (spot-lyric-server, downloaded / built only for
-            this mode) relays on 127.0.0.1:38917
-    direct  pure local: Spotify runs with --disable-web-security
+    cloud   lyrics server stores shared matches (default)
+    local   pure local, NetEase / QQ through the local service (127.0.0.1:38917)
+    direct  pure local, Spotify runs with --disable-web-security
+  How NetEase / QQ are requested on this machine (--request), also in cloud mode:
+    service local service (spot-lyric-server: downloaded / built only when chosen)
+    direct  --disable-web-security            server  only through the lyrics server relay
+  The plugin always prefers local paths: direct -> local service -> lyrics server.
 
 .EXAMPLE
   .\patch.cmd                      # guided install
@@ -44,6 +47,7 @@ $Script:Quiet = $false
 function Say([string]$Text) { if (-not $Script:Quiet) { Write-Host "[spot-lyric] $Text" -ForegroundColor Green } }
 function Warn([string]$Text) { Write-Host "[spot-lyric] $Text" -ForegroundColor Yellow }
 function Fail([string]$Text) { Write-Host "[spot-lyric] $Text" -ForegroundColor Red; exit 1 }
+function Request-Name([string]$R) { switch ($R) { 'service' { '本地服务' } 'direct' { '直连' } 'server' { '经歌词服务器转发' } } }
 function Mode-Name([string]$Mode) { switch ($Mode) { 'cloud' { '云端服务器' } 'local' { '纯本地 · 本地服务' } 'direct' { '纯本地 · 直连' } } }
 
 function Show-Usage {
@@ -62,12 +66,18 @@ Spot-Lyric for Spotify v$Version（Windows；macOS / Linux 运行 ./patch.sh，�
   unhook       移除自动重新注入
 
 使用方式（--mode）:
-  cloud        云端服务器（默认）：服务器保存共享的匹配与歌词，本机无法直连时转发请求
-  local        纯本地 · 本地服务：127.0.0.1:38917 的后台小服务转发请求（仅此方式需要下载 / 编译它）
-  direct       纯本地 · 直连：以 --disable-web-security 启动 Spotify，无后台进程
+  cloud        云端服务器（默认）：服务器保存共享的匹配与歌词
+  local        纯本地 · 本地服务：不连接远程服务器，请求经 127.0.0.1:38917 的本地服务
+  direct       纯本地 · 直连：不连接远程服务器，以 --disable-web-security 启动 Spotify
+
+网易云 / QQ 请求方式（--request，云端模式也可在本机请求；插件始终本地优先：直连 → 本地服务 → 歌词服务器）:
+  service      本地服务（spot-lyric-server，仅选择它时才下载 / 编译）
+  direct       直连（--disable-web-security）
+  server       不在本机请求，全部经歌词服务器转发（仅云端模式）
 
 选项:
   --mode M             使用方式：cloud / local / direct（不指定时分步询问）
+  --request R          网易云 / QQ 请求方式：service / direct / server（不指定时分步询问）
   --server URL         歌词服务器地址（默认 $DefaultServer）
   --local / --direct   等同 --mode local / --mode direct
   --spotify-path P     手动指定 Spotify 安装目录
@@ -82,7 +92,7 @@ Spot-Lyric for Spotify v$Version（Windows；macOS / Linux 运行 ./patch.sh，�
 
 # -------------------------------------------------------------- options ---
 # Long options may be written --name, -name or PowerShell style (-Server, -NoRestart).
-$Command = ''; $Mode = ''; $Server = ''; $SpotifyPath = ''; $RestartPolicy = 'auto'; $Hook = ''; $Yes = $false
+$Command = ''; $Mode = ''; $Request = ''; $Server = ''; $SpotifyPath = ''; $RestartPolicy = 'auto'; $Hook = ''; $Yes = $false
 $argv = @($args)
 for ($i = 0; $i -lt $argv.Count; $i++) {
     $arg = [string]$argv[$i]
@@ -115,12 +125,22 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
                 default { Fail "未知的使用方式：$v（cloud / local / direct）" }
             }
         }
+        'request' {
+            $v = (& $take).ToLower()
+            switch ($v) {
+                { $_ -in 'service', 'local' } { $Request = 'service' }
+                'direct' { $Request = 'direct' }
+                { $_ -in 'server', 'relay', 'remote', 'none' } { $Request = 'server' }
+                default { Fail "未知的请求方式：$v（service / direct / server）" }
+            }
+        }
         'server' {
             $Server = (& $take).Trim().TrimEnd('/')
             if ($Server -notmatch $ServerPattern) { Fail "歌词服务器地址无效：$Server（例如 https://lyrics.example.com）" }
         }
         'spotifypath' { $SpotifyPath = & $take }
-        { $_ -in 'cloud', 'nodirect' } { $Mode = 'cloud' }
+        'cloud' { $Mode = 'cloud' }
+        'nodirect' { $Request = 'server' }
         'local' { $Mode = 'local' }
         'direct' { $Mode = 'direct' }
         'restart' { $RestartPolicy = 'yes' }
@@ -134,19 +154,22 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
     }
 }
 if (-not $Command) { $Command = 'install' }
+if ($Mode -eq 'local' -and $Request -and $Request -ne 'service') { Fail '--mode local 只能配合 --request service（纯本地直连请用 --mode direct）' }
+if ($Mode -eq 'direct' -and $Request -and $Request -ne 'direct') { Fail '--mode direct 只能配合 --request direct（纯本地本地服务请用 --mode local）' }
 
 # --------------------------------------------------------------- config ---
 $ConfigFile = Join-Path $DataDir 'config'
-$CfgMode = ''; $CfgServer = ''
+$CfgMode = ''; $CfgServer = ''; $CfgRequest = ''
 if (Test-Path -LiteralPath $ConfigFile) {
     foreach ($line in [IO.File]::ReadAllLines($ConfigFile, $Utf8)) {
         if ($line -match '^mode=(cloud|local|direct)$') { $CfgMode = $Matches[1] }
+        if ($line -match '^request=(service|direct|server)$') { $CfgRequest = $Matches[1] }
         if ($line -match '^server=(.+)$' -and $Matches[1] -match $ServerPattern) { $CfgServer = $Matches[1] }
     }
 }
-function Save-Config([string]$M, [string]$S) {
+function Save-Config([string]$M, [string]$S, [string]$R) {
     $null = New-Item -ItemType Directory -Force -Path $DataDir
-    $text = "mode=$M`n"
+    $text = "mode=$M`nrequest=$R`n"
     if ($S -ne $DefaultServer) { $text += "server=$S`n" }
     [IO.File]::WriteAllText($ConfigFile, $text, $Utf8)
 }
@@ -189,10 +212,10 @@ function Get-SpotifyVersion([string]$Dir) {
 
 # ---------------------------------------------------------------- build ---
 # The usage mode and both addresses are baked into the plugin.
-function Get-Bundle([string]$M, [string]$S) {
+function Get-Bundle([string]$M, [string]$S, [string]$R) {
     $core = [IO.File]::ReadAllText((Join-Path $Root 'src\core.js'), $Utf8)
     $app = [IO.File]::ReadAllText((Join-Path $Root 'src\app.js'), $Utf8)
-    $app = $app.Replace('__SPOT_LYRIC_VERSION__', $Version).Replace('__SPOT_LYRIC_SERVER__', $S).Replace('__SPOT_LYRIC_MODE__', $M).Replace('__SPOT_LYRIC_LOCAL__', $LocalUrl)
+    $app = $app.Replace('__SPOT_LYRIC_VERSION__', $Version).Replace('__SPOT_LYRIC_SERVER__', $S).Replace('__SPOT_LYRIC_MODE__', $M).Replace('__SPOT_LYRIC_REQUEST__', $R).Replace('__SPOT_LYRIC_LOCAL__', $LocalUrl)
     $js = "/* Spot-Lyric for Spotify v$Version - generated, do not edit */`n" + $core + "`n" + $app
     $css = [IO.File]::ReadAllText((Join-Path $Root 'src\app.css'), $Utf8)
     $jsBytes = $Utf8.GetBytes($js)
@@ -524,7 +547,7 @@ function Remove-LegacyProxy {
 
 # ----------------------------------------------------------------- hook ---
 function Test-HookInstalled { $OnWindows -and [bool](Get-ItemProperty -Path $RunKey -Name 'SpotLyricReapply' -ErrorAction SilentlyContinue) }
-function Install-Hook([string]$M, [string]$S, [string]$Dir) {
+function Install-Hook([string]$M, [string]$S, [string]$R, [string]$Dir) {
     if (-not $OnWindows) { Warn '非 Windows 环境：跳过'; return }
     $target = Join-Path $DataDir 'patcher'
     Remove-Item -LiteralPath $target -Recurse -Force -ErrorAction SilentlyContinue
@@ -535,7 +558,7 @@ function Install-Hook([string]$M, [string]$S, [string]$Dir) {
     Get-ChildItem -LiteralPath $target -Recurse -File | Unblock-File -ErrorAction SilentlyContinue
     Write-HiddenLauncher
     $cmd = Get-HiddenCommand @('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $target 'patch.ps1'),
-        'apply', '--yes', '--quiet', '--mode', $M, '--server', $S, '--spotify-path', $Dir)
+        'apply', '--yes', '--quiet', '--mode', $M, '--request', $R, '--server', $S, '--spotify-path', $Dir)
     $null = New-ItemProperty -Path $RunKey -Name 'SpotLyricReapply' -Value $cmd -PropertyType String -Force
     Say '已安装登录钩子：每次登录 Windows 时检查并重新注入（Spotify 自动更新后生效）'
 }
@@ -597,38 +620,63 @@ function Confirm-Choice([string]$Question, [bool]$Default) {
 # ---------------------------------------------------------------- plan ---
 # Mode in use when nothing was recorded. Before 1.3 there was no pure local mode
 # (-Direct only sped up the cloud mode), so a direct launcher still means cloud.
-function Get-CurrentMode {
-    if ($CfgMode) { return $CfgMode }
-    if (Test-ServiceInstalled) { return 'local' }
-    return 'cloud'
-}
+function Get-CurrentMode { if ($CfgMode) { $CfgMode } else { 'cloud' } }
 function Get-CurrentServer { if ($Server) { $Server } elseif ($CfgServer) { $CfgServer } else { $DefaultServer } }
+# Pure local modes imply their request method. Cloud: the option, the recorded choice, or
+# what is set up (shortcuts with the direct switches from 1.2 -Direct mean direct).
+function Get-CurrentRequest([string]$M) {
+    if ($M -eq 'local') { return 'service' }
+    if ($M -eq 'direct') { return 'direct' }
+    if ($Request) { return $Request }
+    if ($CfgRequest) { return $CfgRequest }
+    if (Test-ServiceInstalled) { return 'service' }
+    if (Test-DirectMode) { return 'direct' }
+    return 'server'
+}
+$ServiceHint = "在 127.0.0.1:38917 运行一个后台小服务（spot-lyric-server，约 10 MB 内存），登录时自动启动；`n只有选择它时才下载（装有 Go 时从源码编译）这个程序，不改 Spotify 的启动方式"
+$DirectHint = "以 --disable-web-security 启动 Spotify，没有后台进程，不需要下载任何程序；会关闭内置浏览器的同源限制`n修改 Spotify 快捷方式和开机自启；使用单独的配置目录，首次需要重新登录 Spotify"
+$Script:Step = 0
+function Next-Step { $Script:Step++; return "[$Script:Step]" }
 
 function Get-Plan {
-    $p = @{ Mode = $Mode; Server = (Get-CurrentServer); Hook = $false }
-    if ($Server -and -not $p.Mode) { $p.Mode = 'cloud' }
+    $p = @{ Mode = $Mode; Request = ''; Server = (Get-CurrentServer); Hook = $false }
+    if (-not $p.Mode -and ($Server -or $Request -eq 'server')) { $p.Mode = 'cloud' }
     $current = Get-CurrentMode
-    $asked = $false
+    $currentReq = Get-CurrentRequest $current
     if (-not $p.Mode) {
-        $kind = Select-Choice '[1/3]' '选择使用方式' $(if ($current -eq 'cloud') { 'cloud' } else { 'pure' }) @(
-            @{ Key = 'cloud'; Label = '云端服务器'; Hint = "歌词服务器保存「使用此歌词」和上传按钮提交的匹配，多台设备共享；`n本机无法直连网易云 / QQ 音乐时由服务器原样转发请求（搜索和匹配仍在本机）" },
+        $kind = Select-Choice (Next-Step) '选择使用方式' $(if ($current -eq 'cloud') { 'cloud' } else { 'pure' }) @(
+            @{ Key = 'cloud'; Label = '云端服务器'; Hint = "歌词服务器保存「使用此歌词」和上传按钮提交的匹配，多台设备共享；`n下一步可选择是否在本机请求网易云 / QQ 音乐（始终本地优先）" },
             @{ Key = 'pure'; Label = '纯本地'; Hint = '不连接任何远程服务器：搜索、匹配、歌词下载都在本机进行，绑定的歌词只保存在本机' })
         if ($kind -eq 'cloud') { $p.Mode = 'cloud' }
+        elseif ($Request) { $p.Mode = $(if ($Request -eq 'direct') { 'direct' } else { 'local' }) }
         else {
-            $p.Mode = Select-Choice '[2/3]' '纯本地：网易云 / QQ 音乐的请求怎么发出？（Spotify 内置浏览器会拦截跨域请求）' $(if ($current -eq 'cloud') { 'local' } else { $current }) @(
-                @{ Key = 'local'; Label = '本地服务'; Hint = "在 127.0.0.1:38917 运行一个后台小服务（spot-lyric-server，约 10 MB 内存），登录时自动启动；`n仅此方式需要下载（装有 Go 时从源码编译）这个程序，不改 Spotify 的启动方式" },
-                @{ Key = 'direct'; Label = '直连'; Hint = "以 --disable-web-security 启动 Spotify，没有后台进程，不需要下载任何程序；会关闭内置浏览器的同源限制`n修改 Spotify 快捷方式和开机自启；使用单独的配置目录，首次需要重新登录 Spotify" })
+            $p.Mode = Select-Choice (Next-Step) '纯本地：网易云 / QQ 音乐的请求怎么发出？（Spotify 内置浏览器会拦截跨域请求）' $(if ($currentReq -eq 'direct') { 'direct' } else { 'local' }) @(
+                @{ Key = 'local'; Label = '本地服务'; Hint = $ServiceHint },
+                @{ Key = 'direct'; Label = '直连'; Hint = $DirectHint })
         }
-        $asked = $Script:Interactive
     }
-    if ($p.Mode -eq 'cloud' -and $asked -and -not $Server) {
-        Write-Host ''
-        while ($true) {
-            $a = Read-Answer "[2/3] 歌词服务器地址（回车使用默认，也可以填自建服务器） [$($p.Server)]: "
-            if (-not $a) { break }
-            $a = $a.TrimEnd('/')
-            if ($a -match $ServerPattern) { $p.Server = $a; break }
-            Write-Host '地址无效，例如 https://lyrics.example.com' -ForegroundColor Yellow
+    switch ($p.Mode) {
+        'local' { if ($Request -and $Request -ne 'service') { Fail '--mode local 只能配合 --request service（纯本地直连请用 --mode direct）' }; $p.Request = 'service' }
+        'direct' { if ($Request -and $Request -ne 'direct') { Fail '--mode direct 只能配合 --request direct（纯本地本地服务请用 --mode local）' }; $p.Request = 'direct' }
+        'cloud' {
+            if ($Script:Interactive -and -not $Server) {
+                Write-Host ''
+                $label = Next-Step
+                while ($true) {
+                    $a = Read-Answer "$label 歌词服务器地址（回车使用默认，也可以填自建服务器） [$($p.Server)]: "
+                    if (-not $a) { break }
+                    $a = $a.TrimEnd('/')
+                    if ($a -match $ServerPattern) { $p.Server = $a; break }
+                    Write-Host '地址无效，例如 https://lyrics.example.com' -ForegroundColor Yellow
+                }
+            }
+            if ($Request) { $p.Request = $Request }
+            else {
+                $p.Request = Select-Choice (Next-Step) '是否在本机请求网易云 / QQ 音乐？（插件始终本地优先：直连 → 本地服务 → 歌词服务器）' $currentReq @(
+                    @{ Key = 'service'; Label = '本地服务'; Hint = $ServiceHint },
+                    @{ Key = 'direct'; Label = '直连'; Hint = $DirectHint },
+                    @{ Key = 'server'; Label = '不在本机请求'; Hint = '全部经歌词服务器原样转发（搜索和匹配仍在本机），什么都不用安装' })
+            }
         }
     }
     switch ($Hook) {
@@ -637,7 +685,7 @@ function Get-Plan {
         default {
             if ($Script:Interactive) {
                 Write-Host ''
-                Write-Host -NoNewline '[3/3] ' -ForegroundColor Cyan; Write-Host 'Spotify 自动更新后重新注入插件？（每次登录 Windows 时检查）'
+                Write-Host -NoNewline "$(Next-Step) " -ForegroundColor Cyan; Write-Host 'Spotify 自动更新后重新注入插件？（每次登录 Windows 时检查）'
                 $p.Hook = Confirm-Choice '安装自动重新注入' $true
             }
             else { $p.Hook = Test-HookInstalled }
@@ -647,13 +695,14 @@ function Get-Plan {
         Write-Host ''
         Write-Host '即将执行：'
         Write-Host "  • 注入歌词插件 v$Version（使用方式：$(Mode-Name $p.Mode)）"
-        switch ($p.Mode) {
-            'cloud' { Write-Host "  • 歌词服务器：$($p.Server)" }
-            'local' { Write-Host "  • 安装本地服务：$LocalUrl，登录时自动启动（需要时下载 / 编译 spot-lyric-server）" }
+        if ($p.Mode -eq 'cloud') { Write-Host "  • 歌词服务器：$($p.Server)" }
+        Write-Host "  • 网易云 / QQ 请求：$(Request-Name $p.Request)（始终本地优先）"
+        switch ($p.Request) {
+            'service' { Write-Host "  • 安装本地服务：$LocalUrl，登录时自动启动（需要时下载 / 编译 spot-lyric-server）" }
             'direct' { Write-Host "  • 让 Spotify 以 $DirectFlag 启动" }
         }
-        if ($p.Mode -ne 'direct' -and (Test-DirectMode)) { Write-Host "  • 取消 Spotify 的直连启动参数（$DirectFlag）" }
-        if ($p.Mode -ne 'local' -and (Test-ServiceInstalled)) { Write-Host '  • 停止并移除本地服务' }
+        if ($p.Request -ne 'direct' -and (Test-DirectMode)) { Write-Host "  • 取消 Spotify 的直连启动参数（$DirectFlag）" }
+        if ($p.Request -ne 'service' -and (Test-ServiceInstalled)) { Write-Host '  • 停止并移除本地服务' }
         if ($p.Hook) { Write-Host '  • 安装自动重新注入' } elseif (Test-HookInstalled) { Write-Host '  • 移除自动重新注入' }
         Write-Host ''
         if (-not (Confirm-Choice '继续' $true)) { Fail '已取消，没有做任何修改' }
@@ -670,8 +719,8 @@ function Get-SpotifyDir {
 }
 
 # Patches for mode / server. Returns @{ Changed; Stopped } (Spotify closed to write: Windows locks xpui.spa).
-function Invoke-Apply([string]$Dir, [string]$M, [string]$S) {
-    $bundle = Get-Bundle $M $S
+function Invoke-Apply([string]$Dir, [string]$M, [string]$S, [string]$R) {
+    $bundle = Get-Bundle $M $S $R
     $needsWrite = (Get-PatchStatus $Dir) -notmatch [regex]::Escape("patched v$Version $($bundle.Digest)")
     $stopped = $false
     if ($needsWrite -and $OnWindows -and (Test-SpotifyRunning)) {
@@ -710,24 +759,24 @@ switch ($Command) {
         }
         $plan = Get-Plan
         Remove-LegacyProxy
-        $r = Invoke-Apply $dir $plan.Mode $plan.Server
+        $r = Invoke-Apply $dir $plan.Mode $plan.Server $plan.Request
         $changed = $r.Changed
-        switch ($plan.Mode) {
-            'cloud' { Remove-LocalService; if (Test-DirectMode) { Set-DirectMode $false; $changed = $true } }
+        switch ($plan.Request) {
+            'service' { if (Test-DirectMode) { Set-DirectMode $false; $changed = $true }; Install-LocalService }
             'direct' { Remove-LocalService; if (-not (Test-DirectMode)) { $changed = $true }; Set-DirectMode $true }
-            'local' { if (Test-DirectMode) { Set-DirectMode $false; $changed = $true }; Install-LocalService }
+            'server' { Remove-LocalService; if (Test-DirectMode) { Set-DirectMode $false; $changed = $true } }
         }
-        if ($plan.Hook) { Install-Hook $plan.Mode $plan.Server $dir } elseif (Test-HookInstalled) { Remove-Hook }
-        Save-Config $plan.Mode $plan.Server
+        if ($plan.Hook) { Install-Hook $plan.Mode $plan.Server $plan.Request $dir } elseif (Test-HookInstalled) { Remove-Hook }
+        Save-Config $plan.Mode $plan.Server $plan.Request
         Invoke-Restart $dir $changed $r.Stopped
         if ($plan.Mode -eq 'cloud') { Say '完成！在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页；旁边的小箭头可把当前歌词上传到服务器。' }
         else { Say '完成！纯本地模式：不连接任何远程服务器。在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页。' }
-        Say '以后想更换使用方式，重新运行本脚本即可。'
+        Say "网易云 / QQ 请求：$(Request-Name $plan.Request)（始终本地优先）。以后想更换方式，重新运行本脚本即可。"
     }
     'apply' {
         $dir = Get-SpotifyDir
         $m = if ($Mode) { $Mode } else { Get-CurrentMode }
-        $r = Invoke-Apply $dir $m (Get-CurrentServer)
+        $r = Invoke-Apply $dir $m (Get-CurrentServer) (Get-CurrentRequest $m)
         Invoke-Restart $dir $r.Changed $r.Stopped
     }
     { $_ -in 'restore', 'uninstall' } {
@@ -757,20 +806,22 @@ switch ($Command) {
         Write-Host "插件版本：v$Version"
         $m = Get-CurrentMode
         Write-Host "使用方式：$(Mode-Name $m)"
+        $req = Get-CurrentRequest $m
+        Write-Host "网易云 / QQ 请求：$(Request-Name $req)（始终本地优先：直连 → 本地服务$(if ($m -eq 'cloud') { ' → 歌词服务器' })）"
         if ($m -eq 'cloud') {
             $s = Get-CurrentServer
             try { $v = (Invoke-RestMethod -Uri "$s/health" -TimeoutSec 8 -UseBasicParsing).version } catch { $v = $null }
             if ($v) { Write-Host "歌词服务器：运行正常 v$v · $s" } else { Write-Host "歌词服务器：无法连接 $s" }
         }
         $v = Get-LocalHealth
-        if ($v) { Write-Host "本地服务：运行中 v$v · $LocalUrl" } elseif ((Test-ServiceInstalled) -or $m -eq 'local') { Write-Host "本地服务：未运行（$LocalUrl）" }
+        if ($v) { Write-Host "本地服务：运行中 v$v · $LocalUrl" } elseif ((Test-ServiceInstalled) -or $req -eq 'service') { Write-Host "本地服务：未运行（$LocalUrl）" }
         if (Test-DirectMode) { Write-Host "直连启动参数：已启用（$DirectFlag）" } else { Write-Host '直连启动参数：未启用' }
         if (Test-HookInstalled) { Write-Host '自动重新注入：已安装' } else { Write-Host '自动重新注入：未安装' }
     }
     'hook' {
         $dir = Get-SpotifyDir
         $m = if ($Mode) { $Mode } else { Get-CurrentMode }
-        Install-Hook $m (Get-CurrentServer) $dir
+        Install-Hook $m (Get-CurrentServer) (Get-CurrentRequest $m) $dir
     }
     'unhook' { Remove-Hook }
 }

@@ -18,6 +18,12 @@
   const LOCAL_SERVICE = '__SPOT_LYRIC_LOCAL__';
   const MODES = ['cloud', 'local', 'direct'];
   const BAKED_MODE = MODES.includes(PATCH_MODE) ? PATCH_MODE : 'cloud';
+  /* How NetEase / QQ are requested on this machine, chosen when patching (also in cloud mode):
+   * direct (--disable-web-security), service (local service) or server (lyrics server relay only).
+   * Whatever was chosen, local paths are always tried first: direct -> local service -> server. */
+  const PATCH_REQUEST = '__SPOT_LYRIC_REQUEST__';
+  const BAKED_REQUEST = ['direct', 'service', 'server'].includes(PATCH_REQUEST) ? PATCH_REQUEST
+    : BAKED_MODE === 'direct' ? 'direct' : BAKED_MODE === 'local' ? 'service' : 'server';
   const LOCAL_URL = /^https?:\/\//.test(LOCAL_SERVICE) ? LOCAL_SERVICE.replace(/\/+$/, '') : 'http://127.0.0.1:38917';
   const log = (...args) => console.log('%c[spot-lyric]', 'color:#1ed760;font-weight:bold', ...args);
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -246,15 +252,19 @@
     return { status: response.status, body: await response.text() };
   }
   const localRelay = new Core.Cloud(localTransport);
-  const checkBackend = () => pureLocal() ? checkLocal() : checkServer();
+  const checkBackend = () => Promise.all([checkLocal(), pureLocal() ? null : checkServer()]);
   const LOCAL_DOWN = '本机无法直连网易云 / QQ 音乐，本地服务也未运行';
+  /* A local service known to be down is re-probed after a while: quickly when it is expected
+   * (chosen when patching), rarely otherwise (it may have been installed meanwhile). */
+  const localUsable = () => localState.ok !== false ||
+    Date.now() - localState.checked > (pureLocal() || BAKED_REQUEST === 'service' ? 15000 : 300000);
 
   /* NetEase / QQ requests run on this machine. The Spotify renderer enforces CORS
    * and neither service sends CORS headers, so a direct request only works when
-   * Spotify was started with --disable-web-security (patch mode "direct"). Otherwise
-   * the local service (pure local) or the lyrics server relays the request it is
-   * given (allow-listed, no logic). */
-  const netState = { direct: null, checked: 0, relayed: 0, directCount: 0 };
+   * Spotify was started with --disable-web-security (request "direct"). Otherwise the
+   * local service relays the request it is given (allow-listed, no logic), and only
+   * when it is not running either, the lyrics server does (cloud mode). */
+  const netState = { direct: null, checked: 0, directCount: 0, localCount: 0, serverCount: 0 };
   const FORBIDDEN_HEADERS = /^(referer|user-agent|cookie|origin|host|connection|content-length)$/i;
   async function directFetch(req, signal) {
     const headers = {};
@@ -277,23 +287,26 @@
         if (signal && signal.aborted) throw new Core.ProviderError('请求已取消', 'cancelled');
         /* Once direct requests worked, a failure is a real network error, not CORS. */
         if (netState.direct === true) { const error = new Core.ProviderError('网络错误：' + (e.message || e), 'network'); error.transient = true; throw error; }
-        if (netState.direct !== false) log(`direct NetEase / QQ requests are blocked (CORS); using the ${pureLocal() ? 'local service' : 'lyrics server'} relay`);
+        if (netState.direct !== false) log('direct NetEase / QQ requests are blocked (CORS); relaying through the local service or the lyrics server');
         netState.direct = false; netState.checked = Date.now();
       }
     }
-    if (pureLocal()) {
-      /* A service known to be down is not retried for every request. */
-      if (localState.ok === false && Date.now() - localState.checked < 15000) throw new Core.ProviderError(LOCAL_DOWN, 'network');
-      netState.relayed++;
-      try { return await localRelay.relay(req, signal); }
-      catch (e) {
+    /* Local service before the lyrics server, in every mode. */
+    if (localUsable()) {
+      try {
+        const response = await localRelay.relay(req, signal);
+        netState.localCount++;
+        return response;
+      } catch (e) {
         if (e.kind === 'cancelled') throw e;
-        throw localState.ok === false ? new Core.ProviderError(LOCAL_DOWN, 'network') : e;
+        /* The service answered: its error is the answer. Not running: next path. */
+        if (localState.ok !== false) throw e;
       }
     }
-    if (!relayAllowed()) throw new Core.ProviderError('本机无法直连网易云 / QQ 音乐（已关闭服务器转发）', 'network');
-    if (serverState.relay === false) throw new Core.ProviderError('本机无法直连，且歌词服务器未开启转发', 'network');
-    netState.relayed++;
+    if (pureLocal()) throw new Core.ProviderError(LOCAL_DOWN, 'network');
+    if (!relayAllowed()) throw new Core.ProviderError('本机无法直连网易云 / QQ 音乐，本地服务未运行（已关闭服务器转发）', 'network');
+    if (serverState.relay === false) throw new Core.ProviderError('本机无法直连，本地服务未运行，且歌词服务器未开启转发', 'network');
+    netState.serverCount++;
     return cloud.relay(req, signal);
   }
 
@@ -765,14 +778,14 @@
       else if (!usable) {
         const failed = /^(请求失败|来源暂不可用)/.test(engine.status);
         /* Without direct access the provider requests depend on the relay (local service or lyrics server). */
-        const relayDown = pureLocal() ? localState.ok === false : (serverState.ok === false || serverState.relay === false || !app.store.setting('relay'));
-        const blocked = failed && netState.direct === false && relayDown;
-        const mode = currentMode();
-        const hint = mode === 'direct'
-          ? 'Spotify 没有以直连参数（--disable-web-security）启动，无法请求网易云音乐 / QQ 音乐。请从开始菜单 / 应用菜单中的 Spotify 启动，或重新运行 patch。'
-          : mode === 'local'
-            ? `本机无法直连网易云音乐 / QQ 音乐，本地服务（${LOCAL_URL}）也未运行。请重新运行 patch 并选择「纯本地 · 本地服务」。`
-            : `本机无法直连网易云音乐 / QQ 音乐，歌词服务器 ${serverConfig().url} 的转发也不可用。可在「设置 > 使用方式与网络」中检查。`;
+        /* Every path failed: direct, the local service and (cloud mode) the lyrics server relay. */
+        const serverDown = pureLocal() || serverState.ok === false || serverState.relay === false || !app.store.setting('relay');
+        const blocked = failed && netState.direct === false && localState.ok === false && serverDown;
+        const hint = BAKED_REQUEST === 'direct'
+          ? 'Spotify 没有以直连参数（--disable-web-security）启动，本地服务也未运行，无法请求网易云音乐 / QQ 音乐。请从开始菜单 / 应用菜单中的 Spotify 启动，或重新运行 patch。'
+          : BAKED_REQUEST === 'service'
+            ? `本机无法直连网易云音乐 / QQ 音乐，本地服务（${LOCAL_URL}）也未运行。请重新运行 patch 并选择本地服务。`
+            : `本机无法直连网易云音乐 / QQ 音乐，没有本地服务，歌词服务器 ${serverConfig().url} 的转发也不可用。可在「设置 > 使用方式与网络」中检查，或重新运行 patch 选择本地请求方式。`;
         state = {
           title: failed ? '无法加载这首歌曲的歌词。稍后再试。' : engine.status === '纯音乐，没有歌词' ? '这是一首纯音乐。' : '我们好像没有这首歌的歌词。',
           sub: blocked ? hint : engine.status,
@@ -1026,8 +1039,8 @@
       if (!this.statusEl) return;
       const engine = this.app.engine, ok = Core.lyricsUsable(engine.lyrics);
       this.statusEl.className = 'sl-status ' + (engine.busy ? 'sl-busy' : ok ? 'sl-ok' : 'sl-miss');
-      const note = pureLocal() ? (netState.direct === false && localState.ok === false ? ' · 本地服务未运行' : '')
-        : serverState.ok === false ? ' · 歌词服务器未连接' : '';
+      const note = netState.direct === false && localState.ok === false && pureLocal() ? ' · 本地服务未运行'
+        : !pureLocal() && serverState.ok === false ? ' · 歌词服务器未连接' : '';
       this.statusEl.textContent = engine.status + note;
     }
     async search() {
@@ -1154,15 +1167,17 @@
         }, text))));
       const globalOffset = store.getInt('timing-offset-ms', 0);
       const trackOffset = engine.offset() - globalOffset;
-      const local = pureLocal(), mode = currentMode();
-      const stats = engine.http.stats, cloudStats = local ? localRelay.stats : cloud.stats;
+      const local = pureLocal();
+      const stats = engine.http.stats, localStats = localRelay.stats, cloudStats = cloud.stats;
       const server = serverConfig();
       const serverLine = serverState.ok ? `已连接 · v${serverState.version}${serverState.storage === 'r2' ? ' · 匹配保存在 Cloudflare R2' : ''}${serverState.relay === false ? ' · 未开启转发' : ''}` : serverState.ok === false ? `未连接${serverState.error ? '：' + serverState.error : ''}` : '检测中…';
-      const netLine = netState.direct === true ? `本机直连网易云 / QQ 音乐（${netState.directCount} 次请求）`
-        : netState.direct === false ? (local
-          ? `直连被 Spotify 拦截（CORS），${localState.ok ? `经本地服务转发（${netState.relayed} 次）` : '本地服务未运行'}`
-          : `直连被 Spotify 拦截（CORS），${store.setting('relay') ? `经歌词服务器转发（${netState.relayed} 次）` : '已关闭转发'}`)
-        : '尚未发出请求';
+      const REQUEST_NAMES = { direct: '直连', service: '本地服务', server: '经歌词服务器转发' };
+      const used = [];
+      if (netState.directCount) used.push(`直连 ${netState.directCount} 次`);
+      if (netState.localCount) used.push(`本地服务 ${netState.localCount} 次`);
+      if (netState.serverCount) used.push(`歌词服务器 ${netState.serverCount} 次`);
+      const netOrder = `安装时选择：${REQUEST_NAMES[BAKED_REQUEST]} · 始终本地优先：直连 → 本地服务${local ? '' : ' → 歌词服务器'}`;
+      const netLine = `${netState.direct === false ? '直连被 Spotify 拦截（CORS）；' : ''}${used.length ? '本次：' + used.join('，') : '尚未发出请求'}`;
       const localLine = localState.ok ? `运行中 · v${localState.version} · ${LOCAL_URL}` : localState.ok === false ? `未运行（${LOCAL_URL}）` : '检测中…';
       /* The pure local variant offered here follows the patch (local service or direct). */
       const pureMode = BAKED_MODE === 'cloud' ? 'local' : BAKED_MODE;
@@ -1175,10 +1190,8 @@
         }, text))));
       const localRows = [
         h('div', { class: 'sl-setting' }, h('span', { class: 'sl-setting-text' }, h('span', null, '本地服务'),
-          h('small', { class: localState.ok ? 'sl-good-text' : localState.ok === false && mode === 'local' ? 'sl-error' : '' }, localLine)),
+          h('small', { class: localState.ok ? 'sl-good-text' : localState.ok === false && BAKED_REQUEST === 'service' ? 'sl-error' : '' }, localLine)),
           h('button', { type: 'button', class: 'sl-btn sl-btn-ghost sl-btn-small', onclick: async () => { await checkLocal(); this.renderBody(); } }, '检测')),
-        h('div', { class: 'sl-setting sl-setting-column' }, h('span', { class: 'sl-setting-text' }, h('span', null, '说明'),
-          h('small', null, '搜索、匹配和歌词下载都在本机进行。网易云 / QQ 音乐的请求优先直连（patch 时选择「直连」，Spotify 以 --disable-web-security 启动），否则交给本机的本地服务转发（patch 时选择「本地服务」）。'))),
       ];
       const saveServer = async () => {
         const url = cleanServerUrl(this.serverInput.value);
@@ -1215,7 +1228,7 @@
         offsetRow('当前歌曲偏移', trackOffset, v => engine.setOffset(v, false)),
         h('h3', null, '使用方式与网络'),
         modeRow,
-        ...(local ? localRows : [h('div', { class: 'sl-setting' }, h('span', { class: 'sl-setting-text' }, h('span', null, '服务器状态'), h('small', { class: serverState.ok ? 'sl-good-text' : serverState.ok === false ? 'sl-error' : '' }, serverLine)),
+        ...(local ? [] : [h('div', { class: 'sl-setting' }, h('span', { class: 'sl-setting-text' }, h('span', null, '服务器状态'), h('small', { class: serverState.ok ? 'sl-good-text' : serverState.ok === false ? 'sl-error' : '' }, serverLine)),
           h('button', { type: 'button', class: 'sl-btn sl-btn-ghost sl-btn-small', onclick: async () => { await checkServer(); this.renderBody(); } }, '检测')),
         h('div', { class: 'sl-setting sl-setting-column' },
           h('span', { class: 'sl-setting-text' }, h('span', null, '服务器地址'), h('small', null, '搜索、匹配和歌词下载在本机进行；服务器只保存「使用此歌词」和播放栏上传按钮提交的匹配与歌词，供所有设备共享。可改为自己部署的服务器。')),
@@ -1224,10 +1237,12 @@
             h('button', { type: 'button', class: 'sl-btn sl-btn-ghost sl-btn-small', onclick: () => { this.serverInput.value = cleanServerUrl(DEFAULT_SERVER); this.tokenInput.value = ''; saveServer(); } }, '恢复默认'),
             h('button', { type: 'button', class: 'sl-btn sl-btn-green sl-btn-small', onclick: saveServer }, '保存'))),
         ]),
-        h('div', { class: 'sl-setting' }, h('span', { class: 'sl-setting-text' }, h('span', null, '网络'), h('small', { class: netState.direct === true ? 'sl-good-text' : '' }, netLine))),
-        local ? null : toggle('relay', '允许服务器转发', '本机无法直连时，由歌词服务器原样转发网易云 / QQ 音乐请求（匹配仍在本机进行）'),
+        ...localRows,
+        h('div', { class: 'sl-setting' }, h('span', { class: 'sl-setting-text' }, h('span', null, '网易云 / QQ 请求'),
+          h('small', null, netOrder), h('small', { class: netState.direct === true || netState.localCount ? 'sl-good-text' : '' }, netLine))),
+        local ? null : toggle('relay', '允许服务器转发', '直连和本地服务都不可用时，由歌词服务器原样转发网易云 / QQ 音乐请求（匹配仍在本机进行）'),
         h('div', { class: 'sl-setting' }, h('span', { class: 'sl-setting-text' }, h('span', null, '本次会话'),
-          h('small', null, `音乐平台 ${stats.requests} 次请求 · ${local ? '本地服务' : '服务器'} ${cloudStats.requests} 次 · ${fmtBytes(stats.sent_bytes + stats.received_bytes + cloudStats.sent_bytes + cloudStats.received_bytes)} · 缓存命中 ${stats.cache_hits} 次`)),
+          h('small', null, `音乐平台 ${stats.requests} 次请求 · 本地服务 ${localStats.requests} 次 · 歌词服务器 ${cloudStats.requests} 次 · ${fmtBytes(stats.sent_bytes + stats.received_bytes + localStats.sent_bytes + localStats.received_bytes + cloudStats.sent_bytes + cloudStats.received_bytes)} · 缓存命中 ${stats.cache_hits} 次`)),
           h('button', { type: 'button', class: 'sl-btn sl-btn-ghost sl-btn-small', onclick: async () => { await store.cacheClear(); toast(local ? '本机缓存已清理，绑定的匹配与本地歌词已保留' : '本机缓存已清理，服务器上的匹配与本地歌词已保留'); } }, '清理缓存')),
         h('p', { class: 'sl-about' }, `Spot-Lyric for Spotify v${VERSION} · 匹配：繁简归一、版本标签、多艺术家 / CV 别名、分级时长（参考 Lyricify、LDDC）；总时长差超过 3 秒或版本不同不自动绑定。`));
     }
@@ -1241,7 +1256,8 @@
   }
 
   /* ---------------------------------------------------------- boot ----- */
-  window.__spotLyric = { version: VERSION };
+  /* net: the request paths, for diagnostics in the devtools console and for tests. */
+  window.__spotLyric = { version: VERSION, mode: BAKED_MODE, request: BAKED_REQUEST, net: { transport: providerTransport, state: netState, local: localState, server: serverState } };
   waitFor(() => {
     const platform = findPlatform();
     return platform && platform.getRegistry().resolve(Symbol.for('PlayerAPI')) && document.getElementById('main-view') ? platform : null;

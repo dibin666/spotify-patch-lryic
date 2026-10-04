@@ -1,7 +1,7 @@
 // Lyrics server (storage + relay: `spot-lyric-server serve`, Go code in server/) and the client engine
 // that uses it, end to end, with fake NetEase / QQ on the client side and the server's
 // local-directory storage. Also covers pure local mode (no lyrics server).
-//   node --test tests/        (needs Go; builds cmd/spot-lyric-server once)
+//   node --test tests/server.test.mjs   (needs Go; builds cmd/spot-lyric-server once)
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';

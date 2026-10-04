@@ -1,4 +1,4 @@
-// Run: node --test tests/   (set SPOT_LYRIC_OFFLINE=1 to skip live provider tests)
+// Run: node --test tests/core.test.mjs   (set SPOT_LYRIC_OFFLINE=1 to skip live provider tests)
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
