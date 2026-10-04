@@ -20,6 +20,26 @@ Spotify 桌面客户端第三方歌词插件（支持 Windows / macOS / Linux）
 
 > **注意**：Windows 不支持 Microsoft Store 商店版（请从官网下载安装）。Spotify 自动更新后重新运行脚本即可（或使用 `hook` 自动重注）。
 
+### 一键安装（无需克隆仓库）
+
+脚本会下载最新代码到临时目录并运行，命令后面可直接追加参数（如 `restore`、`status`、`--server ...`）。
+
+**macOS / Linux**
+
+```bash
+d=$(mktemp -d) && curl -fsSL https://github.com/dibin666/spotify-patch-lryic/archive/refs/heads/main.tar.gz | tar xz -C "$d" --strip-components=1 && bash "$d/patch.sh"
+# 追加参数示例：... && bash "$d/patch.sh" restore
+```
+
+**Windows**（PowerShell）
+
+```powershell
+$d="$env:TEMP\spot-lyric"; Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue; Invoke-WebRequest https://github.com/dibin666/spotify-patch-lryic/archive/refs/heads/main.zip -OutFile "$d.zip"; Expand-Archive "$d.zip" $d -Force; & "$d\spotify-patch-lryic-main\patch.ps1"
+# 追加参数示例：... patch.ps1 restore    或    patch.ps1 -Server https://lyrics.example.com
+```
+
+`hook` 会把所需文件复制到固定位置，所以用一键方式执行 `hook` 后，临时目录删除也不影响自动重新注入。
+
 ### Windows
 
 双击运行 `patch.cmd`，或在终端执行：
