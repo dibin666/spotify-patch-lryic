@@ -1,0 +1,40 @@
+# Spot-Lyric lyrics server.
+#   cd server && cp .env.example .env   # fill in R2 credentials
+#   docker compose up -d --build
+# Optional Cloudflare Tunnel sidecar: set TUNNEL_TOKEN in .env and run
+#   docker compose --profile tunnel up -d --build
+# then point the tunnel's public hostname to http://spot-lyric-server:8080
+name: spot-lyric
+
+services:
+  spot-lyric-server:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    image: spot-lyric-server:latest
+    container_name: spot-lyric-server
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      # Only reachable locally by default; a tunnel / reverse proxy publishes it.
+      - "${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-38917}:8080"
+    volumes:
+      # Only used when no R2 bucket is configured (local-directory storage).
+      - data:/data
+    logging:
+      driver: json-file
+      options: { max-size: 10m, max-file: "3" }
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: [tunnel]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN:-}
+    depends_on: [spot-lyric-server]
+
+volumes:
+  data:
