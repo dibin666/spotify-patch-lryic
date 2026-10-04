@@ -86,7 +86,7 @@ if [[ -f "$SRC/mac/Spotify.app/Contents/Resources/Apps/xpui.spa" ]]; then
   cp "$SRC/mac/Spotify.app/Contents/Resources/Apps/xpui.spa" "$app/Contents/Resources/Apps/"
   run_unix_suite "macOS" macos "$app" "$app/Contents/Resources/Apps" "$SRC/mac/Spotify.app/Contents/Resources/Apps/xpui.spa"
   out="$(env SPOT_LYRIC_PLATFORM=macos "$BASH_BIN" "$ROOT/patch.sh" status --spotify-path "$app/Contents/Resources" 2>&1 || true)"
-  check "macOS: --spotify-path accepts Contents/Resources" '[[ $out == *"Spotify：$app"* ]]'
+  check "macOS: --spotify-path accepts Contents/Resources" '[[ $out == *"Spotify：$(cd "$app" && pwd -P)"* ]]'
   out="$(env SPOT_LYRIC_PLATFORM=macos "$BASH_BIN" "$ROOT/patch.sh" install --yes --mode direct --no-restart --spotify-path "$app" 2>&1 || true)"
   check "macOS: direct mode refused" '[[ $out == *不支持直连* ]]'
 fi
