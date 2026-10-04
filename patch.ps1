@@ -586,7 +586,8 @@ function Read-Answer([string]$Prompt) {
 function Select-Choice([string]$Step, [string]$Title, [string]$Default, $Items) {
     if (-not $Script:Interactive) { return $Default }
     Write-Host ''
-    Write-Host -NoNewline "$Step " -ForegroundColor Cyan; Write-Host $Title
+    if ($Step) { Write-Host -NoNewline "$Step " -ForegroundColor Cyan }
+    Write-Host $Title
     $def = 1
     for ($n = 0; $n -lt $Items.Count; $n++) {
         $it = $Items[$n]
@@ -643,8 +644,35 @@ $ServerHint = 'Spotify 内置浏览器会拦截跨域请求，由歌词服务器
 $Script:Step = 0
 function Next-Step { $Script:Step++; return "[$Script:Step]" }
 
+# Installed before (choices recorded) and nothing asked for on the command line: offer a
+# one-step update with the same choices instead of walking through every step again.
+function Get-QuickPlan {
+    if (-not ($CfgMode -and -not ($Mode -or $Request -or $Server -or $Hook) -and $Script:Interactive)) { return $null }
+    $req = Get-CurrentRequest $CfgMode
+    $summary = "使用方式：$(Mode-Name $CfgMode)"
+    if ($CfgMode -eq 'cloud') { $summary += " · 网易云 / QQ 请求：$(Request-Name $req)`n歌词服务器：$(Get-CurrentServer)" }
+    $summary += "`n自动重新注入：$(if (Test-HookInstalled) { '已安装' } else { '未安装' })"
+    $action = Select-Choice '' '已安装过 Spot-Lyric，要做什么？' 'update' @(
+        @{ Key = 'update'; Label = "更新到 v$Version（沿用当前设置）"; Hint = $summary },
+        @{ Key = 'setup'; Label = '重新设置'; Hint = '重新选择使用方式、歌词服务器和请求方式' },
+        @{ Key = 'uninstall'; Label = '卸载'; Hint = '还原 Spotify，并移除钩子、本地服务和直连启动参数' })
+    if ($action -eq 'update') {
+        Write-Host ''
+        return @{ Action = 'update'; Mode = $CfgMode; Request = $req; Server = (Get-CurrentServer); Hook = [bool](Test-HookInstalled) }
+    }
+    if ($action -eq 'uninstall') {
+        Write-Host ''
+        if (-not (Confirm-Choice '确定卸载 Spot-Lyric' $false)) { Fail '已取消，没有做任何修改' }
+        Write-Host ''
+        return @{ Action = 'uninstall' }
+    }
+    return $null
+}
+
 function Get-Plan {
-    $p = @{ Mode = $Mode; Request = ''; Server = (Get-CurrentServer); Hook = $false }
+    $quick = Get-QuickPlan
+    if ($quick) { return $quick }
+    $p = @{ Action = 'install'; Mode = $Mode; Request = ''; Server = (Get-CurrentServer); Hook = $false }
     if (-not $p.Mode -and ($Server -or $Request -eq 'server')) { $p.Mode = 'cloud' }
     $current = Get-CurrentMode
     $currentReq = Get-CurrentRequest 'cloud'
@@ -750,6 +778,21 @@ function Invoke-Restart([string]$Dir, [bool]$Changed, [bool]$Stopped) {
     elseif ($Changed) { Say '下次启动 Spotify 时生效' }
 }
 
+function Invoke-RestoreCommand([string]$Cmd) {
+    $dir = Get-SpotifyDir
+    $wasRunning = $OnWindows -and (Test-SpotifyRunning)
+    if ($wasRunning) { Stop-Spotify }
+    $result = Invoke-Restore $dir
+    if ($result -eq 'RESTORED') { Say '已还原 Spotify 原始文件' } else { Say 'Spotify 未被修改，无需还原' }
+    if ($Cmd -eq 'uninstall') {
+        Remove-LegacyProxy; Remove-Hook; if (Test-DirectMode) { Set-DirectMode $false }; Remove-LocalService
+        foreach ($f in @($ConfigFile, $ServiceExe, $HiddenVbs, (Join-Path $DataDir 'local.log'))) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+        Remove-Item -LiteralPath (Join-Path $DataDir 'data') -Recurse -Force -ErrorAction SilentlyContinue
+        Say '已卸载 Spot-Lyric'
+    }
+    if ($wasRunning -and $RestartPolicy -ne 'no') { Start-Spotify $dir }
+}
+
 switch ($Command) {
     'install' {
         if (-not $Script:Quiet) { Write-Host "Spot-Lyric for Spotify v$Version"; Write-Host "系统：Windows（$env:PROCESSOR_ARCHITECTURE）" }
@@ -758,6 +801,7 @@ switch ($Command) {
             Write-Host "Spotify：$dir"; Write-Host "版本：$(Get-SpotifyVersion $dir)"; Write-Host "补丁：$(Describe-Patch (Get-PatchStatus $dir))"
         }
         $plan = Get-Plan
+        if ($plan.Action -eq 'uninstall') { Invoke-RestoreCommand 'uninstall'; break }
         Remove-LegacyProxy
         $r = Invoke-Apply $dir $plan.Mode $plan.Server $plan.Request
         $changed = $r.Changed
@@ -769,10 +813,13 @@ switch ($Command) {
         if ($plan.Hook) { Install-Hook $plan.Mode $plan.Server $plan.Request $dir } elseif (Test-HookInstalled) { Remove-Hook }
         Save-Config $plan.Mode $plan.Server $plan.Request
         Invoke-Restart $dir $changed $r.Stopped
-        if ($plan.Mode -eq 'cloud') { Say '完成！在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页；旁边的小箭头可把当前歌词上传到服务器。' }
-        else { Say '完成！纯本地模式：不连接任何远程服务器。在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页。' }
-        if ($plan.Mode -eq 'cloud') { Say "网易云 / QQ 请求：$(Request-Name $plan.Request)。以后想更换方式，重新运行本脚本即可。" }
-        else { Say '以后想更换方式，重新运行本脚本即可。' }
+        if ($plan.Action -eq 'update') { Say '完成！以后想更换使用方式，重新运行本脚本并选择「重新设置」。' }
+        else {
+            if ($plan.Mode -eq 'cloud') { Say '完成！在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页；旁边的小箭头可把当前歌词上传到服务器。' }
+            else { Say '完成！纯本地模式：不连接任何远程服务器。在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页。' }
+            if ($plan.Mode -eq 'cloud') { Say "网易云 / QQ 请求：$(Request-Name $plan.Request)。以后想更换方式，重新运行本脚本即可。" }
+            else { Say '以后想更换方式，重新运行本脚本即可。' }
+        }
     }
     'apply' {
         $dir = Get-SpotifyDir
@@ -780,20 +827,7 @@ switch ($Command) {
         $r = Invoke-Apply $dir $m (Get-CurrentServer) (Get-CurrentRequest $m)
         Invoke-Restart $dir $r.Changed $r.Stopped
     }
-    { $_ -in 'restore', 'uninstall' } {
-        $dir = Get-SpotifyDir
-        $wasRunning = $OnWindows -and (Test-SpotifyRunning)
-        if ($wasRunning) { Stop-Spotify }
-        $result = Invoke-Restore $dir
-        if ($result -eq 'RESTORED') { Say '已还原 Spotify 原始文件' } else { Say 'Spotify 未被修改，无需还原' }
-        if ($Command -eq 'uninstall') {
-            Remove-LegacyProxy; Remove-Hook; if (Test-DirectMode) { Set-DirectMode $false }; Remove-LocalService
-            foreach ($f in @($ConfigFile, $ServiceExe, $HiddenVbs, (Join-Path $DataDir 'local.log'))) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
-            Remove-Item -LiteralPath (Join-Path $DataDir 'data') -Recurse -Force -ErrorAction SilentlyContinue
-            Say '已卸载 Spot-Lyric'
-        }
-        if ($wasRunning -and $RestartPolicy -ne 'no') { Start-Spotify $dir }
-    }
+    { $_ -in 'restore', 'uninstall' } { Invoke-RestoreCommand $Command }
     'status' {
         Write-Host "Spot-Lyric for Spotify v$Version"
         Write-Host "系统：Windows（$env:PROCESSOR_ARCHITECTURE）"

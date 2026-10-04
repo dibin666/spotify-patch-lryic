@@ -123,7 +123,13 @@
           request.onerror = () => resolve(null);
         } catch (_) { resolve(null); }
       });
-      if (!this.db) log('IndexedDB unavailable, using memory store');
+      if (!this.db) { log('IndexedDB unavailable, using memory store'); return; }
+      /* Settings live in IndexedDB: Spotify (CEF) loses recent localStorage writes when it is
+       * killed (patch restart, logout, crash), which silently reverted toggles such as 显示译文.
+       * localStorage stays as a synchronous mirror and the source for older installs. */
+      const saved = await this.kvGet(SETTINGS_KEY);
+      if (saved && typeof saved === 'object') this.values = { ...saved };
+      else if (Object.keys(this.values).length) this.kvSet(SETTINGS_KEY, { ...this.values });
     }
     /* settings (sync) */
     setting(key) { return key in this.values ? this.values[key] : DEFAULTS[key]; }
@@ -133,6 +139,7 @@
     set(key, value) {
       if (value === undefined) delete this.values[key]; else this.values[key] = value;
       try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(this.values)); } catch (_) { /* quota */ }
+      if (this.db) this._put('kv', { k: SETTINGS_KEY, v: { ...this.values } });
     }
     /* idb helpers */
     _tx(name, mode, fn) {
@@ -318,8 +325,6 @@
       this.playerAPI = this.registry.resolve(Symbol.for('PlayerAPI'));
       this.store = new Store();
       serverConfig = () => ({ url: cleanServerUrl(this.store.setting('server_url') || DEFAULT_SERVER), token: this.store.setting('server_token') || '' });
-      /* A mode picked in the settings lasts until Spotify is patched with another mode. */
-      if (this.store.get('patch_mode', '') !== BAKED_MODE) { this.store.set('mode', undefined); this.store.set('patch_mode', BAKED_MODE); }
       currentMode = () => { const m = this.store.get('mode', ''); return MODES.includes(m) ? m : BAKED_MODE; };
       this.state = this.playerAPI.getState();
       this.open = false; this.ignoreNav = 0;
@@ -335,6 +340,9 @@
     }
     async start() {
       await this.store.open();
+      /* A mode picked in the settings lasts until Spotify is patched with another mode. */
+      if (this.store.get('patch_mode', '') !== BAKED_MODE) { this.store.set('mode', undefined); this.store.set('patch_mode', BAKED_MODE); }
+      this.engine.cloud = pureLocal() ? null : cloud;
       this.view = new LyricsView(this);
       this.entry = new EntryButton(this);
       this.mini = new MiniLyrics(this);
@@ -661,7 +669,6 @@
   /* Opening brackets (「 『 （ …) leave half an em blank at a line start, which makes those lines look
    * indented. Lines that begin with one get `sl-hang` (see app.css) so every line aligns left. */
   const HANG_RE = /^\s*[「『【〈《〔〖（［｛]/;
-  const CARD_HEADING = /^(关于艺人|提供者|队列中的下一首歌?|下一首|About the artist|Credits|Next in queue)$/i;
   const hangClass = text => HANG_RE.test(text || '') ? ' sl-hang' : '';
   function applyTheme(el, theme) {
     el.dataset.bg = theme.mode;
@@ -671,9 +678,18 @@
     el.style.setProperty('--lyrics-color-active', theme.colors.active);
   }
 
+  function scrollParent(el) {
+    for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+      if (/(auto|scroll)/.test(getComputedStyle(p).overflowY) && p.clientHeight) return p;
+    }
+    return null;
+  }
+
   /* ------------------------------------------ right sidebar mini lyrics - */
-  /* A scaled-down lyrics view inside Spotify's "Now playing" sidebar, placed above the
-   * artist card. Colours, background, translation and font scale follow the main page. */
+  /* A scaled-down lyrics view inside Spotify's "Now playing" sidebar, right below the cover,
+   * title and artist, filling the rest of the visible sidebar (the cards below - related
+   * videos, artist, credits, queue - follow it). Colours, background, translation and
+   * font scale follow the main page. */
   class MiniLyrics {
     constructor(app) {
       this.app = app;
@@ -698,33 +714,49 @@
         this.pending = setTimeout(() => { this.pending = 0; if (this.enabled() && !this.inPlace()) this.attach(); }, 250);
       });
       this.observer.observe(document.body, { childList: true, subtree: true });
+      /* Height follows the sidebar: window resizes and the cover growing / shrinking. */
+      this.sizer = new ResizeObserver(() => this.resize());
       this.refresh();
     }
     /* Not shown while the full lyrics page is open: it would only repeat it. */
     enabled() { return this.app.store.setting('mini_player') !== false && !this.app.open; }
-    /* Spotify's class names are hashed, so the first card under the cover ("关于艺人", "提供者", ...)
-     * is found by its heading text, then widened to the whole card. */
+    /* Spotify's class names are hashed: the block holding the cover, title and artist is the
+     * panel child that contains the track title. The mini view goes right after it, as a
+     * sibling of the cards (same width, same 16px gap). */
     anchor() {
       const panel = document.querySelector('[data-testid="NPV_Panel_OpenDiv"]');
       if (!panel) return null;
-      let card = null;
-      for (const node of panel.querySelectorAll('*')) {
-        if (node.childElementCount || this.el.contains(node) || !CARD_HEADING.test(node.textContent.trim())) continue;
-        card = node; break;
-      }
-      if (!card) return null;
-      while (card.parentElement && card.parentElement !== panel && !(card.offsetHeight >= 100 && card.parentElement.childElementCount > 1)) card = card.parentElement;
-      return card;
+      let header = panel.querySelector('[data-testid="context-item-info-title"]');
+      while (header && header.parentElement !== panel) header = header.parentElement;
+      if (!header) header = Array.from(panel.children).find(c => c !== this.el) || null;
+      return header;
     }
-    inPlace() { const a = this.anchor(); return !!a && this.el.isConnected && this.el.nextElementSibling === a; }
+    inPlace() { const a = this.anchor(); return !!a && this.el.isConnected && this.el.previousElementSibling === a; }
     attach() {
       const anchor = this.anchor();
-      if (!anchor) { this.el.remove(); return; }
-      anchor.before(this.el);
+      if (!anchor) { this.el.remove(); this.sizer.disconnect(); return; }
+      anchor.after(this.el);
+      this.sizer.disconnect();
+      this.scrollParent = scrollParent(this.el);
+      if (this.scrollParent) this.sizer.observe(this.scrollParent);
+      this.sizer.observe(anchor);
+      this.resize();
+      this.update(true);
+    }
+    /* From below the title down to the bottom of the visible sidebar (when scrolled to the top). */
+    resize() {
+      const port = this.scrollParent;
+      if (!port || !this.el.isConnected) return;
+      const top = this.el.getBoundingClientRect().top - port.getBoundingClientRect().top + port.scrollTop;
+      const height = Math.round(Math.max(220, port.clientHeight - top - 16));
+      if (Math.abs(height - (this.height || 0)) < 2) return;
+      this.height = height;
+      this.el.style.setProperty('--sl-mini-h', `${height}px`);
+      this.active = -2;
       this.update(true);
     }
     refresh() {
-      if (!this.enabled()) { this.el.remove(); clearInterval(this.timer); this.timer = 0; return; }
+      if (!this.enabled()) { this.el.remove(); this.sizer.disconnect(); clearInterval(this.timer); this.timer = 0; return; }
       const app = this.app;
       if (app.pendingTrack !== undefined) { app.engine.setTrack(app.pendingTrack); app.pendingTrack = undefined; }
       if (!this.timer) this.timer = setInterval(() => { if (document.visibilityState === 'visible' && this.el.isConnected) this.update(false); }, 300);

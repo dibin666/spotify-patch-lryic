@@ -112,19 +112,22 @@
 /* ---------- sidebar mini lyrics ---------- */
 .sl-mini {
   --lyrics-color-background: rgb(83, 83, 83); --lyrics-color-inactive: rgba(255, 255, 255, .5); --lyrics-color-active: #fff; --sl-scale: 1;
-  container-type: inline-size; position: relative; overflow: hidden; isolation: isolate;
-  margin: 8px 16px 16px; border-radius: 8px; aspect-ratio: 1 / .9; min-height: 160px; max-height: 60vh;
+  --sl-mini-h: 420px;
+  container-type: inline-size; position: relative; flex: none; overflow: hidden; isolation: isolate;
+  margin: 0; border-radius: 8px; height: var(--sl-mini-h);
   color: var(--lyrics-color-active);
 }
-.sl-mini-scroll { position: absolute; inset: 0; overflow-y: auto; overflow-x: hidden; scrollbar-width: none; overscroll-behavior: contain;
+/* Follows playback only (scrolled from script): the wheel keeps scrolling the sidebar itself. */
+.sl-mini-scroll { position: absolute; inset: 0; overflow: hidden; scrollbar-width: none;
   -webkit-mask-image: linear-gradient(180deg, transparent, #000 16%, #000 84%, transparent); mask-image: linear-gradient(180deg, transparent, #000 16%, #000 84%, transparent); }
 .sl-mini-scroll::-webkit-scrollbar { display: none; }
 .sl-mini-lines {
-  position: relative; padding: 44% 8%; box-sizing: border-box; display: flex; flex-direction: column;
+  position: relative; padding: calc(var(--sl-mini-h) * .42) 16px; box-sizing: border-box; display: flex; flex-direction: column;
   font-family: var(--encore-title-font-stack, sans-serif); font-weight: 700; line-height: 1.3; text-wrap: balance;
-  font-size: calc(clamp(13px, 6.4cqw, 28px) * var(--sl-scale));
+  font-size: calc(clamp(15px, 7cqw, 28px) * var(--sl-scale));
 }
-.sl-mini .sl-line { margin-bottom: .7em; }
+.sl-mini .sl-line { margin-bottom: .65em; }
+.sl-mini .sl-trans { font-size: .72em; margin-top: .15em; }
 .sl-mini-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; padding: 16px; text-align: center;
   font: 400 .875rem/1.4 var(--encore-body-font-stack, sans-serif); color: var(--lyrics-color-active); opacity: .75; }
 .sl-mini-scroll[hidden], .sl-mini-empty[hidden] { display: none !important; }

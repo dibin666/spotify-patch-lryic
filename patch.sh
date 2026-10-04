@@ -23,7 +23,9 @@ if [[ -n ${BASH_SOURCE[0]:-} && -f ${BASH_SOURCE[0]} ]]; then ROOT="$(cd -- "$(d
 # Run without a checkout (curl ... | bash): fetch the sources, then run them.
 if [[ -z $ROOT || ! -f $ROOT/src/app.js ]]; then
   tmp="$(mktemp -d)"
-  printf '\033[1;32m[spot-lyric]\033[0m 下载 Spot-Lyric（%s）…\n' "$REPO" >&2
+  # Only the scripts and the plugin sources (a few hundred KB); the local service program is
+  # fetched later and only for the pure local mode.
+  printf '\033[1;32m[spot-lyric]\033[0m 获取最新的补丁脚本与歌词插件（github.com/%s）…\n' "$REPO" >&2
   if command -v curl >/dev/null 2>&1; then
     curl -fsSL "https://github.com/$REPO/archive/refs/heads/main.tar.gz" | tar xz -C "$tmp" --strip-components=1
   else
@@ -184,9 +186,17 @@ as_user() {
   else sudo -u "$TARGET_USER" HOME="$TARGET_HOME" "$@"
   fi
 }
+# Root for system files (apt hook, re-signing): one notice and one password prompt per run.
+SUDO_READY=0
+need_root() {  # need_root REASON
+  [[ $(id -u) == 0 || $SUDO_READY == 1 ]] && return 0
+  say "需要管理员权限（sudo）：$1"
+  sudo -v || die "没有获得管理员权限"
+  SUDO_READY=1
+}
 privileged() {
   if [[ $(id -u) == 0 ]]; then "$@"
-  else say "需要管理员权限（sudo）"; sudo "$@"
+  else need_root "修改系统文件"; sudo "$@"
   fi
 }
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -c1-64; else shasum -a 256 | cut -c1-64; fi; }
@@ -496,7 +506,7 @@ describe_patch() {
 macos_resign() {
   [[ $PLATFORM == macos ]] || return 0
   command -v codesign >/dev/null 2>&1 || { warn "未找到 codesign，跳过重新签名（如 Spotify 无法启动，请安装 Xcode Command Line Tools：xcode-select --install）"; return 0; }
-  local run=""; [[ -w "$SPOTIFY_DIR" ]] || run=privileged
+  local run=""; [[ -w "$SPOTIFY_DIR" ]] || { run=privileged; need_root "重新签名 Spotify.app"; }
   $run xattr -cr "$SPOTIFY_DIR" 2>/dev/null || true
   if $run codesign -f --deep -s - "$SPOTIFY_DIR" >/dev/null 2>&1 && codesign --verify --deep --strict "$SPOTIFY_DIR" >/dev/null 2>&1; then
     say "已重新签名 Spotify.app（ad-hoc）"
@@ -625,6 +635,7 @@ enable_direct() {
       /var/lib/flatpak/exports/share/applications/com.spotify.Client.desktop; do
     [[ -f $f ]] && { src="$f"; break; }
   done
+  local was=0; direct_enabled && was=1
   as_user mkdir -p "$(dirname "$DESKTOP_OVERRIDE")" "$SPOTIFY_PROFILE"
   [[ -e $DIRECT_PROFILE && ! -L $DIRECT_PROFILE ]] && die "$DIRECT_PROFILE 已存在且不是符号链接，请先移走它"
   as_user ln -sfn "$SPOTIFY_PROFILE" "$DIRECT_PROFILE"
@@ -637,6 +648,7 @@ enable_direct() {
     fi
     printf 'X-Spot-Lyric=direct\n'
   } | as_user tee "$DESKTOP_OVERRIDE" >/dev/null
+  if [[ $was == 1 ]]; then say "直连启动参数已启用（${DESKTOP_OVERRIDE}）"; return 0; fi
   say "已启用直连：应用菜单中的 Spotify 将以 $DIRECT_ARGS 启动（${DESKTOP_OVERRIDE}）"
   say "其它启动方式（自建快捷方式、AppImage、开机自启）请自行加上这两个参数"
 }
@@ -793,20 +805,29 @@ PLIST
     return 0
   fi
   hook_supported || { warn "未检测到 apt：自动重新注入仅适用于 deb 安装的 Spotify"; return 0; }
+  # Unchanged scripts and settings: nothing to write (and no sudo prompt).
+  if [[ "$(cat "$APT_HOOK_FILE" 2>/dev/null)" == "$(apt_hook_line "$mode" "$server" "$request")" ]] &&
+     cmp -s "$ROOT/patch.sh" "$APT_HOOK_DIR/patch.sh" && cmp -s "$ROOT/VERSION" "$APT_HOOK_DIR/VERSION" &&
+     diff -rq "$ROOT/src" "$APT_HOOK_DIR/src" >/dev/null 2>&1; then
+    say "apt 钩子已是最新（${APT_HOOK_FILE}）"; return 0
+  fi
+  need_root "写入 apt 钩子 ${APT_HOOK_FILE}"
   privileged rm -rf "$APT_HOOK_DIR"
   privileged mkdir -p "$APT_HOOK_DIR"
   privileged cp -r "$ROOT/patch.sh" "$ROOT/VERSION" "$ROOT/src" "$ROOT/tools" "$APT_HOOK_DIR/"
   privileged chmod -R a+rX "$APT_HOOK_DIR"
-  printf '%s\n' "DPkg::Post-Invoke { \"if [ -x $APT_HOOK_DIR/patch.sh ] && [ -d '$APPS' ]; then $APT_HOOK_DIR/patch.sh apply --yes --quiet --no-restart --mode $mode --request $request --server $server --spotify-path '$SPOTIFY_DIR' || true; fi\"; };" \
-    | privileged tee "$APT_HOOK_FILE" >/dev/null
+  apt_hook_line "$mode" "$server" "$request" | privileged tee "$APT_HOOK_FILE" >/dev/null
   say "已安装 apt 钩子：${APT_HOOK_FILE}（spotify-client 升级后自动重新注入）"
+}
+apt_hook_line() {  # apt_hook_line MODE SERVER REQUEST
+  printf '%s\n' "DPkg::Post-Invoke { \"if [ -x $APT_HOOK_DIR/patch.sh ] && [ -d '$APPS' ]; then $APT_HOOK_DIR/patch.sh apply --yes --quiet --no-restart --mode $1 --request $3 --server $2 --spotify-path '$SPOTIFY_DIR' || true; fi\"; };"
 }
 remove_hook() {
   if [[ $PLATFORM == macos ]]; then
     if [[ -f "$AGENT_DIR/$REAPPLY_LABEL.plist" ]]; then unload_agent "$REAPPLY_LABEL"; say "已移除 LaunchAgent 钩子"; fi
     as_user rm -rf "$DATA_DIR/patcher"; return 0
   fi
-  if [[ -e $APT_HOOK_FILE || -d $APT_HOOK_DIR ]]; then privileged rm -rf "$APT_HOOK_FILE" "$APT_HOOK_DIR"; say "已移除 apt 钩子"; fi
+  if [[ -e $APT_HOOK_FILE || -d $APT_HOOK_DIR ]]; then need_root "移除 apt 钩子 ${APT_HOOK_FILE}"; privileged rm -rf "$APT_HOOK_FILE" "$APT_HOOK_DIR"; say "已移除 apt 钩子"; fi
   return 0
 }
 
@@ -825,7 +846,7 @@ choose() {
   local step="$1" title="$2" def="$3"; shift 3
   CHOICE="$def"; interactive || return 0
   local items=("$@") i=0 n="$#" defi=1 key label hint off rest
-  printf '\n%s %s\n' "$(paint '1;36' "$step")" "$(paint 1 "$title")"
+  printf '\n%s%s\n' "${step:+$(paint '1;36' "$step") }" "$(paint 1 "$title")"
   for i in $(seq 1 "$n"); do
     IFS='|' read -r key label hint off <<< "${items[$((i - 1))]}"
     [[ $key == "$def" ]] && defi=$i
@@ -877,9 +898,35 @@ SERVER_HINT="Spotify 内置浏览器会拦截跨域请求，由歌词服务器�
 STEP=0
 next_step() { STEP=$((STEP + 1)); }
 
-P_MODE=""; P_REQ=""; P_SERVER=""; P_HOOK=0
+P_MODE=""; P_REQ=""; P_SERVER=""; P_HOOK=0; P_ACTION=install
+# Installed before (choices recorded) and nothing asked for on the command line: offer a
+# one-step update with the same choices instead of walking through every step again.
+quick_plan() {
+  [[ -n $CFG_MODE && -z $MODE$REQUEST$SERVER$HOOK ]] && interactive || return 1
+  local req summary
+  req="$(current_request "$CFG_MODE")"
+  [[ $req == direct && $PLATFORM == macos ]] && req=server
+  summary="使用方式：$(mode_name "$CFG_MODE")"
+  [[ $CFG_MODE == cloud ]] && summary="$summary · 网易云 / QQ 请求：$(request_name "$req")\n歌词服务器：$(current_server)"
+  summary="$summary\n自动重新注入：$(hook_installed && echo 已安装 || echo 未安装)"
+  choose "" "已安装过 Spot-Lyric，要做什么？" update \
+    "update|更新到 v${VERSION}（沿用当前设置）|$summary|" \
+    "setup|重新设置|重新选择使用方式、歌词服务器和请求方式|" \
+    "uninstall|卸载|还原 Spotify，并移除钩子、本地服务和直连启动参数|"
+  case "$CHOICE" in
+    update)
+      P_ACTION=update; P_MODE="$CFG_MODE"; P_SERVER="$(current_server)"; P_REQ="$req"
+      P_HOOK=0; hook_installed && P_HOOK=1
+      printf '\n'; return 0 ;;
+    uninstall)
+      printf '\n'; confirm "确定卸载 Spot-Lyric" n || die "已取消，没有做任何修改"
+      P_ACTION=uninstall; printf '\n'; return 0 ;;
+  esac
+  return 1
+}
 make_plan() {
   local current current_req
+  quick_plan && return 0
   P_MODE="$MODE"; P_SERVER="$(current_server)"
   [[ -z $P_MODE && ( -n $SERVER || $REQUEST == server ) ]] && P_MODE=cloud
   current="$(current_mode)"; current_req="$(current_request cloud)"
@@ -959,10 +1006,24 @@ show_spotify() {
   [[ $QUIET == 1 ]] && return 0
   printf 'Spotify：%s\n版本：%s\n补丁：%s\n' "$SPOTIFY_DIR" "$(spotify_version)" "$(describe_patch "$(patcher status 2>/dev/null || true)")"
 }
+restore_cmd() {  # restore_cmd restore|uninstall
+  local result changed=0
+  result="$(run_patcher restore)" || die "还原失败：$result"
+  if [[ $result == *RESTORED* ]]; then say "已还原 Spotify 原始文件"; macos_resign; changed=1; else say "Spotify 未被修改，无需还原"; fi
+  if [[ $1 == uninstall ]]; then
+    remove_legacy_proxy; remove_hook; disable_direct; remove_service
+    as_user rm -f "$CONFIG_FILE" "$SERVICE_BIN" "$DATA_DIR/local.log"
+    as_user rm -rf "$DATA_DIR/data"
+    as_user rmdir "$DATA_DIR" 2>/dev/null || true
+    say "已卸载 Spot-Lyric"
+  fi
+  restart_spotify "$changed"
+}
 case "$COMMAND" in
   install)
     header; need_spotify; show_spotify
     make_plan
+    [[ $P_ACTION == uninstall ]] && { restore_cmd uninstall; exit 0; }
     remove_legacy_proxy
     do_apply "$P_MODE" "$P_SERVER" "$P_REQ"
     changed=$PATCH_CHANGED
@@ -974,10 +1035,13 @@ case "$COMMAND" in
     if [[ $P_HOOK == 1 ]]; then install_hook "$P_MODE" "$P_SERVER" "$P_REQ"; elif hook_installed; then remove_hook; fi
     save_config "$P_MODE" "$P_SERVER" "$P_REQ"
     restart_spotify "$changed"
-    if [[ $P_MODE == cloud ]]; then say "完成！在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页；旁边的小箭头可把当前歌词上传到服务器。"
-    else say "完成！纯本地模式：不连接任何远程服务器。在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页。"; fi
-    if [[ $P_MODE == cloud ]]; then say "网易云 / QQ 请求：$(request_name "$P_REQ")。以后想更换方式，重新运行本脚本即可。"
-    else say "以后想更换方式，重新运行本脚本即可。"; fi
+    if [[ $P_ACTION == update ]]; then say "完成！以后想更换使用方式，重新运行本脚本并选择「重新设置」。"
+    else
+      if [[ $P_MODE == cloud ]]; then say "完成！在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页；旁边的小箭头可把当前歌词上传到服务器。"
+      else say "完成！纯本地模式：不连接任何远程服务器。在 Spotify 底部播放栏（官方歌词按钮左侧）点击新的歌词图标打开歌词页。"; fi
+      if [[ $P_MODE == cloud ]]; then say "网易云 / QQ 请求：$(request_name "$P_REQ")。以后想更换方式，重新运行本脚本即可。"
+      else say "以后想更换方式，重新运行本脚本即可。"; fi
+    fi
     ;;
   apply)
     need_spotify
@@ -987,17 +1051,7 @@ case "$COMMAND" in
     ;;
   restore|uninstall)
     need_spotify
-    result="$(run_patcher restore)" || die "还原失败：$result"
-    changed=0
-    if [[ $result == *RESTORED* ]]; then say "已还原 Spotify 原始文件"; macos_resign; changed=1; else say "Spotify 未被修改，无需还原"; fi
-    if [[ $COMMAND == uninstall ]]; then
-      remove_legacy_proxy; remove_hook; disable_direct; remove_service
-      as_user rm -f "$CONFIG_FILE" "$SERVICE_BIN" "$DATA_DIR/local.log"
-      as_user rm -rf "$DATA_DIR/data"
-      as_user rmdir "$DATA_DIR" 2>/dev/null || true
-      say "已卸载 Spot-Lyric"
-    fi
-    restart_spotify "$changed"
+    restore_cmd "$COMMAND"
     ;;
   status)
     QUIET=0; header

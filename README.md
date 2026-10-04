@@ -26,7 +26,9 @@ curl -fsSL https://raw.githubusercontent.com/dibin666/spotify-patch-lryic/main/p
 $d="$env:TEMP\spot-lyric"; Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue; Invoke-WebRequest https://github.com/dibin666/spotify-patch-lryic/archive/refs/heads/main.zip -OutFile "$d.zip"; Expand-Archive "$d.zip" $d -Force; powershell -NoProfile -ExecutionPolicy Bypass -File "$d\spotify-patch-lryic-main\patch.ps1"
 ```
 
-在仓库目录中运行 `./patch.sh`（Windows 为 `patch.cmd`），按提示选择即可。
+在仓库目录中运行 `./patch.sh`（Windows 为 `patch.cmd`），按提示选择即可。安装过之后再运行，会直接询问「更新 / 重新设置 / 卸载」，默认沿用上次的设置更新。
+
+安装命令只下载补丁脚本和歌词插件；本地服务程序（spot-lyric-server）只在选择「纯本地」时才下载或编译。
 
 > Windows 不支持 Microsoft Store 版 Spotify。
 
