@@ -1,16 +1,14 @@
 # Spot-Lyric lyrics server. Build from the repository root:
 #   docker build -f server/Dockerfile -t spot-lyric-server .
 # (server/docker-compose.yml does this for you)
-# The image runs `spot-lyric serve`: the same program that patches Spotify and runs
-# the local service, as a static binary on an empty image (~10 MB).
+# The image runs `spot-lyric-server serve` (the same program is the local service of
+# pure local mode) as a static binary on an empty image (~10 MB).
 FROM golang:1.24-alpine AS build
 WORKDIR /src
 COPY go.mod *.go VERSION ./
-COPY src/ ./src/
 COPY server/*.go ./server/
-COPY patcher/ ./patcher/
 COPY cmd/ ./cmd/
-RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/spot-lyric-server ./cmd/spot-lyric \
+RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o /out/spot-lyric-server ./cmd/spot-lyric-server \
  && mkdir -p /out/data && chown 1000:1000 /out/data \
  && mkdir -p /out/etc \
  && echo 'node:x:1000:1000:node:/data:/sbin/nologin' > /out/etc/passwd \

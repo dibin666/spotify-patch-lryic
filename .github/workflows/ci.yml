@@ -26,21 +26,37 @@ jobs:
       # The live test hits real NetEase / QQ APIs, which throttle datacenter addresses: run it locally.
       - run: node --test tests/core.test.mjs tests/server.test.mjs
         env: { SPOT_LYRIC_OFFLINE: '1' }
+      # patch.sh (python + zip patchers) and patch.ps1 (pwsh) on a synthetic xpui.spa.
+      - run: bash tests/patch_test.sh
 
-  # spot-lyric for every system (patcher + local service + server in one program), each built
-  # and tested on a native runner of its own system / architecture.
+  # The patch scripts on their own systems: macOS with its bash 3.2, Windows PowerShell 5.1.
+  patch-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tests/patch_test.sh
+        env: { BASH_BIN: /bin/bash, PWSH: '' }
+  patch-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: powershell -NoProfile -ExecutionPolicy Bypass -File tests\patch_test.ps1
+
+  # spot-lyric-server (lyrics server / local service of pure local mode) for every system,
+  # each built and tested on a native runner of its own system / architecture.
+  # patch.sh / patch.ps1 download it only for --mode local (when Go is not installed).
   binaries:
     needs: test
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { runner: ubuntu-latest,    asset: spot-lyric-linux-amd64 }
-          - { runner: ubuntu-24.04-arm, asset: spot-lyric-linux-arm64 }
-          - { runner: macos-15-intel,   asset: spot-lyric-darwin-amd64 }
-          - { runner: macos-latest,     asset: spot-lyric-darwin-arm64 }
-          - { runner: windows-latest,   asset: spot-lyric-windows-amd64.exe }
-          - { runner: windows-11-arm,   asset: spot-lyric-windows-arm64.exe }
+          - { runner: ubuntu-latest,    asset: spot-lyric-server-linux-amd64 }
+          - { runner: ubuntu-24.04-arm, asset: spot-lyric-server-linux-arm64 }
+          - { runner: macos-15-intel,   asset: spot-lyric-server-darwin-amd64 }
+          - { runner: macos-latest,     asset: spot-lyric-server-darwin-arm64 }
+          - { runner: windows-latest,   asset: spot-lyric-server-windows-amd64.exe }
+          - { runner: windows-11-arm,   asset: spot-lyric-server-windows-arm64.exe }
     runs-on: ${{ matrix.runner }}
     env:
       CGO_ENABLED: '0'
@@ -51,7 +67,7 @@ jobs:
           go-version: '1.24'
           cache: false
       - run: go test ./...
-      - run: go build -trimpath -ldflags "-s -w" -o dist/${{ matrix.asset }} ./cmd/spot-lyric
+      - run: go build -trimpath -ldflags "-s -w" -o dist/${{ matrix.asset }} ./cmd/spot-lyric-server
       - run: ./dist/${{ matrix.asset }} version
       - uses: actions/upload-artifact@v4
         with:
@@ -60,9 +76,8 @@ jobs:
           if-no-files-found: error
 
   # Release v<VERSION>: created by the first push of a version, assets refreshed by later pushes.
-  # patch.sh / patch.ps1 download these when Go is not installed.
   release:
-    needs: binaries
+    needs: [binaries, patch-macos, patch-windows]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
@@ -72,9 +87,9 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
-          pattern: spot-lyric-*
+          pattern: spot-lyric-server-*
           merge-multiple: true
-      - run: cd dist && sha256sum spot-lyric-* > SHA256SUMS && cat SHA256SUMS
+      - run: cd dist && sha256sum spot-lyric-server-* > SHA256SUMS && cat SHA256SUMS
       - name: Publish release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -86,9 +101,13 @@ jobs:
           fi
           if ! gh release view "$tag" >/dev/null 2>&1; then
             gh release create "$tag" --target "$GITHUB_SHA" --title "Spot-Lyric $tag" \
-              --notes "spot-lyric for Windows / macOS / Linux: patches Spotify, runs the local service (pure local mode) and the lyrics server. Usually started through patch.sh / patch.cmd, see README."
+              --notes "spot-lyric-server for Windows / macOS / Linux: the local service of pure local mode (installed by patch.sh / patch.cmd with --mode local) and the lyrics server. See README."
           fi
           gh release upload "$tag" dist/* --clobber
+          # Drop assets this build no longer ships.
+          for asset in $(gh release view "$tag" --json assets -q '.assets[].name'); do
+            [ -f "dist/$asset" ] || gh release delete-asset "$tag" "$asset" -y
+          done
 
   # Docker image: amd64 and arm64 are built separately, each on a native runner.
   build:

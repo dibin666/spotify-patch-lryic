@@ -1,7 +1,7 @@
-// Lyrics server (storage + relay: `spot-lyric serve`, Go code in server/) and the client engine
+// Lyrics server (storage + relay: `spot-lyric-server serve`, Go code in server/) and the client engine
 // that uses it, end to end, with fake NetEase / QQ on the client side and the server's
 // local-directory storage. Also covers pure local mode (no lyrics server).
-//   node --test tests/        (needs Go; builds cmd/spot-lyric once)
+//   node --test tests/        (needs Go; builds cmd/spot-lyric-server once)
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -16,8 +16,8 @@ const require = createRequire(import.meta.url);
 const core = require('../src/core.js');
 
 const repoDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const binary = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'spot-lyric-bin-')), 'spot-lyric');
-execFileSync('go', ['build', '-o', binary, './cmd/spot-lyric'], { cwd: repoDir, env: { ...process.env, CGO_ENABLED: '0' } });
+const binary = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'spot-lyric-bin-')), 'spot-lyric-server');
+execFileSync('go', ['build', '-o', binary, './cmd/spot-lyric-server'], { cwd: repoDir, env: { ...process.env, CGO_ENABLED: '0' } });
 
 const lrc = list => list.map((t, i) => `[00:${String(10 + i * 3).padStart(2, '0')}.00]${t}`).join('\n');
 const SONGS = {
