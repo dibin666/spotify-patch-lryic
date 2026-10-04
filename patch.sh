@@ -46,7 +46,7 @@ APT_HOOK_FILE=/etc/apt/apt.conf.d/99spot-lyric-patch
 
 usage() {
   cat <<USAGE
-Spot-Lyric for Spotify v$VERSION（macOS / Linux；Windows 运行 patch.cmd，命令和参数相同）
+Spot-Lyric for Spotify v${VERSION}（macOS / Linux；Windows 运行 patch.cmd，命令和参数相同）
 
 用法: ./patch.sh [命令] [选项]
 
@@ -66,7 +66,7 @@ Spot-Lyric for Spotify v$VERSION（macOS / Linux；Windows 运行 patch.cmd，�
 
 选项:
   --mode M             使用方式：cloud / local / direct（不指定时分步询问）
-  --server URL         歌词服务器地址（默认 $DEFAULT_SERVER）
+  --server URL         歌词服务器地址（默认 ${DEFAULT_SERVER}）
   --local / --direct   等同 --mode local / --mode direct
   --spotify-path P     手动指定 Spotify 位置（Linux：含 Apps/xpui.spa 的目录；macOS：Spotify.app）
   --hook / --no-hook   安装 / 不安装自动重新注入
@@ -114,12 +114,12 @@ while [[ $# -gt 0 ]]; do
         cloud|server|remote) MODE=cloud ;;
         local|service) MODE=local ;;
         direct) MODE=direct ;;
-        *) die "未知的使用方式：$value（cloud / local / direct）" ;;
+        *) die "未知的使用方式：${value}（cloud / local / direct）" ;;
       esac ;;
     server)
       take "$@"; [[ $has_value == 1 ]] || shift
       SERVER="${value%/}"
-      [[ $SERVER =~ $SERVER_RE ]] || die "歌词服务器地址无效：$SERVER（例如 https://lyrics.example.com）" ;;
+      [[ $SERVER =~ $SERVER_RE ]] || die "歌词服务器地址无效：${SERVER}（例如 https://lyrics.example.com）" ;;
     spotifypath) take "$@"; [[ $has_value == 1 ]] || shift; SPOTIFY_PATH="$value" ;;
     cloud|nodirect) MODE=cloud ;;
     local) MODE=local ;;
@@ -493,8 +493,8 @@ do_apply() {  # do_apply MODE SERVER
   fi
   rm -rf "$tmp"
   case "$result" in
-    *UNCHANGED*) say "插件已是最新（v$VERSION，$(mode_name "$1")），无需修改"; PATCH_CHANGED=0 ;;
-    *PATCHED*)   say "已注入歌词插件 v$VERSION（$(mode_name "$1")）→ ${result##*PATCHED * }"; PATCH_CHANGED=1; macos_resign ;;
+    *UNCHANGED*) say "插件已是最新（v${VERSION}，$(mode_name "$1")），无需修改"; PATCH_CHANGED=0 ;;
+    *PATCHED*)   say "已注入歌词插件 v${VERSION}（$(mode_name "$1")）→ ${result##*PATCHED * }"; PATCH_CHANGED=1; macos_resign ;;
     *) [[ $PLATFORM == macos && $result == *"ermitted"* ]] && macos_permission_hint; die "注入失败：$result" ;;
   esac
 }
@@ -608,7 +608,7 @@ enable_direct() {
     fi
     printf 'X-Spot-Lyric=direct\n'
   } | as_user tee "$DESKTOP_OVERRIDE" >/dev/null
-  say "已启用直连：应用菜单中的 Spotify 将以 $DIRECT_ARGS 启动（$DESKTOP_OVERRIDE）"
+  say "已启用直连：应用菜单中的 Spotify 将以 $DIRECT_ARGS 启动（${DESKTOP_OVERRIDE}）"
   say "其它启动方式（自建快捷方式、AppImage、开机自启）请自行加上这两个参数"
 }
 disable_direct() {
@@ -647,7 +647,7 @@ obtain_server() {  # installs $SERVICE_BIN
   asset="spot-lyric-server-$os-$arch"
   for tag in "v$VERSION" latest; do
     if [[ $tag == latest ]]; then base="https://github.com/$REPO/releases/latest/download"; else base="https://github.com/$REPO/releases/download/$tag"; fi
-    say "下载本地服务 $asset（$tag）…"
+    say "下载本地服务 ${asset}（${tag}）…"
     if command -v curl >/dev/null 2>&1; then curl -fsSL --retry 2 -o "$tmp/$asset" "$base/$asset" 2>/dev/null || continue
       curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" 2>/dev/null || true
     else wget -q -O "$tmp/$asset" "$base/$asset" 2>/dev/null || continue
@@ -686,7 +686,7 @@ install_service() {
 </plist>
 PLIST
     launch_agent "$SERVICE_LABEL" "$AGENT_DIR/$SERVICE_LABEL.plist"
-    say "已安装 LaunchAgent $SERVICE_LABEL（登录时自动启动本地服务）"
+    say "已安装 LaunchAgent ${SERVICE_LABEL}（登录时自动启动本地服务）"
   elif have_user_systemd; then
     as_user mkdir -p "$UNIT_DIR"
     printf '[Unit]\nDescription=Spot-Lyric local lyrics service (%s)\nAfter=network-online.target\n\n[Service]\nExecStart="%s" serve --local --data "%s"\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n' \
@@ -694,8 +694,8 @@ PLIST
     as_user rm -f "$CONFIG_HOME/autostart/spot-lyric-local.desktop"
     as_user systemctl --user daemon-reload
     as_user systemctl --user enable "$SERVICE_UNIT" >/dev/null 2>&1 || die "无法启用 $SERVICE_UNIT"
-    as_user systemctl --user restart "$SERVICE_UNIT" || die "无法启动 $SERVICE_UNIT（日志：journalctl --user -u $SERVICE_UNIT）"
-    say "已安装 systemd 用户服务 $SERVICE_UNIT（登录时自动启动本地服务）"
+    as_user systemctl --user restart "$SERVICE_UNIT" || die "无法启动 ${SERVICE_UNIT}（日志：journalctl --user -u ${SERVICE_UNIT}）"
+    say "已安装 systemd 用户服务 ${SERVICE_UNIT}（登录时自动启动本地服务）"
   else
     as_user mkdir -p "$CONFIG_HOME/autostart"
     printf '[Desktop Entry]\nType=Application\nName=Spot-Lyric local service\nExec="%s" serve --local --data "%s"\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n' \
@@ -707,7 +707,7 @@ PLIST
   fi
   for i in $(seq 1 50); do
     v="$(local_health)"
-    [[ -n $v ]] && { say "本地服务运行中：$LOCAL_URL（v$v）"; return 0; }
+    [[ -n $v ]] && { say "本地服务运行中：${LOCAL_URL}（v${v}）"; return 0; }
     sleep 0.2
   done
   die "本地服务没有在 $LOCAL_URL 上响应（端口 38917 可能被其它程序占用），日志：$log"
@@ -770,7 +770,7 @@ PLIST
   privileged chmod -R a+rX "$APT_HOOK_DIR"
   printf '%s\n' "DPkg::Post-Invoke { \"if [ -x $APT_HOOK_DIR/patch.sh ] && [ -d '$APPS' ]; then $APT_HOOK_DIR/patch.sh apply --yes --quiet --no-restart --mode $mode --server $server --spotify-path '$SPOTIFY_DIR' || true; fi\"; };" \
     | privileged tee "$APT_HOOK_FILE" >/dev/null
-  say "已安装 apt 钩子：$APT_HOOK_FILE（spotify-client 升级后自动重新注入）"
+  say "已安装 apt 钩子：${APT_HOOK_FILE}（spotify-client 升级后自动重新注入）"
 }
 remove_hook() {
   if [[ $PLATFORM == macos ]]; then
@@ -964,8 +964,8 @@ case "$COMMAND" in
     fi
     v="$(local_health)"
     if [[ -n $v ]]; then echo "本地服务：运行中 v$v · $LOCAL_URL"
-    elif service_installed || [[ $mode == local ]]; then echo "本地服务：未运行（$LOCAL_URL）"; fi
-    if [[ $PLATFORM == linux ]]; then direct_enabled && echo "直连启动参数：已启用（$DIRECT_FLAG）" || echo "直连启动参数：未启用"; fi
+    elif service_installed || [[ $mode == local ]]; then echo "本地服务：未运行（${LOCAL_URL}）"; fi
+    if [[ $PLATFORM == linux ]]; then direct_enabled && echo "直连启动参数：已启用（${DIRECT_FLAG}）" || echo "直连启动参数：未启用"; fi
     if ! hook_supported; then echo "自动重新注入：不可用"; elif hook_installed; then echo "自动重新注入：已安装"; else echo "自动重新注入：未安装"; fi
     ;;
   hook) need_spotify; install_hook "${MODE:-$(current_mode)}" "$(current_server)" ;;
