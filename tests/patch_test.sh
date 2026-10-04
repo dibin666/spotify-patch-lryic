@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# End-to-end patcher test: patch.sh (python and zip patchers) and patch.ps1 on copies of
-# Spotify archives, in a throw-away HOME (the real user configuration is never touched).
+# End-to-end patcher test: patch.sh (pure sh: no python / zip / unzip) and patch.ps1 on
+# copies of Spotify archives, in a throw-away HOME (the real user configuration is never touched).
+# The test itself uses zip / unzip to build and check archives.
 #   tests/patch_test.sh [dir-with-installers-unpacked]
 # Expects (any subset):  linux/xpui.spa  win/Apps/xpui.spa  mac/Spotify.app/Contents/Resources/Apps/xpui.spa
 # Without a directory a small synthetic xpui.spa is used for all three layouts (CI).
@@ -15,13 +16,10 @@ mkdir -p "$HOME"
 SRC="${1:-}"
 if [[ -z $SRC ]]; then
   SRC="$WORK/src"; mkdir -p "$SRC/linux" "$SRC/win/Apps" "$SRC/mac/Spotify.app/Contents/Resources/Apps"
-  python3 - "$SRC/linux/xpui.spa" <<'PY'
-import sys, zipfile
-with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED) as z:
-    z.writestr("index.html", '<!doctype html><html><head></head><body><div id="main"></div></body></html>')
-    z.writestr("xpui.js", "console.log('spotify');\n" * 500)
-    z.writestr("images/a.svg", "<svg/>")
-PY
+  ( mkdir -p "$WORK/gen/images" && cd "$WORK/gen" &&
+    printf '<!doctype html><html><head></head><body><div id="main"></div></body></html>' > index.html &&
+    for i in $(seq 1 500); do echo "console.log('spotify');"; done > xpui.js && printf '<svg/>' > images/a.svg &&
+    zip -q -X "$SRC/linux/xpui.spa" index.html xpui.js images/a.svg )
   cp "$SRC/linux/xpui.spa" "$SRC/win/Apps/"; cp "$SRC/linux/xpui.spa" "$SRC/mac/Spotify.app/Contents/Resources/Apps/"
 fi
 pass=0; fail=0
@@ -32,12 +30,15 @@ marker() { unzip -p "$1" index.html | sed -n 's/.*<!-- spot-lyric:start v\([^ ]*
 baked() { unzip -p "$1" spot-lyric/spot-lyric.js | grep -c "const PATCH_MODE = '$2'" || true; }
 sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -c1-16; }
 
-run_unix_suite() {  # name platform patcher spotify_path apps_dir original_spa
-  local name="$1" platform="$2" patcher="$3" path="$4" apps="$5" orig="$6" out m1 m2 m3
-  echo "== $name ($platform, $patcher patcher, bash $("$BASH_BIN" -c 'echo $BASH_VERSION'))"
-  local sh=(env SPOT_LYRIC_PLATFORM="$platform" SPOT_LYRIC_PATCHER="$patcher" "$BASH_BIN" "$ROOT/patch.sh")
+# patch.sh must not need python / zip / unzip: shadow them with tools that fail loudly.
+mkdir -p "$WORK/shim"
+for t in python python3 zip unzip; do printf '#!/bin/sh\necho "patch.sh used %s" >&2\nexit 99\n' "$t" > "$WORK/shim/$t"; chmod +x "$WORK/shim/$t"; done
+run_unix_suite() {  # name platform spotify_path apps_dir original_spa
+  local name="$1" platform="$2" path="$3" apps="$4" orig="$5" out m1 m2 m3
+  echo "== $name ($platform, bash $("$BASH_BIN" -c 'echo $BASH_VERSION'))"
+  local sh=(env PATH="$WORK/shim:$PATH" SPOT_LYRIC_PLATFORM="$platform" "$BASH_BIN" "$ROOT/patch.sh")
   out="$("${sh[@]}" apply --yes --mode cloud --no-restart --spotify-path "$path" 2>&1)"
-  check "apply injects" '[[ $out == *已注入* ]]'
+  check "apply injects" '[[ $out == *已注入* && $out != *"patch.sh used"* ]]'
   m1="$(marker "$apps/xpui.spa")"
   check "marker present ($m1)" '[[ -n $m1 ]]'
   check "assets in archive" 'unzip -l "$apps/xpui.spa" | grep -q spot-lyric/spot-lyric.js && unzip -l "$apps/xpui.spa" | grep -q spot-lyric/spot-lyric.css'
@@ -45,6 +46,7 @@ run_unix_suite() {  # name platform patcher spotify_path apps_dir original_spa
   check "script tag before </body>" 'unzip -p "$apps/xpui.spa" index.html | grep -q "src=\"/spot-lyric/spot-lyric.js\"></script><!-- spot-lyric:end --></body>"'
   check "archive integrity" 'unzip -tqq "$apps/xpui.spa"'
   check "original entries kept" '[[ $(unzip -Z1 "$apps/xpui.spa" | grep -vc "^spot-lyric/") -eq $(unzip -Z1 "$orig" | wc -l) ]]'
+  check "original entries unchanged" '(for f in $(unzip -Z1 "$orig" | grep -v "^index.html$" | head -n 20); do [[ $(unzip -p "$orig" "$f" | cksum) == $(unzip -p "$apps/xpui.spa" "$f" | cksum) ]] || exit 1; done)'
   check "backup equals original" '[[ $(sha "$apps/xpui.spa.spot-lyric.bak") == $(sha "$orig") ]]'
   check "cloud mode baked in" '[[ $(baked "$apps/xpui.spa" cloud) -eq 1 ]]'
   out="$("${sh[@]}" apply --yes --mode cloud --no-restart --spotify-path "$path" 2>&1)"
@@ -64,21 +66,23 @@ run_unix_suite() {  # name platform patcher spotify_path apps_dir original_spa
   check "restore" '[[ $out == *已还原* ]]'
   check "restored byte-identical" '[[ $(sha "$apps/xpui.spa") == $(sha "$orig") ]]'
   check "backup removed" '[[ ! -e "$apps/xpui.spa.spot-lyric.bak" ]]'
-  DIGESTS+=("$name/$patcher=${m1#* }")
+  "${sh[@]}" apply --yes --mode cloud --no-restart --spotify-path "$path" >/dev/null 2>&1
+  rm -f "$apps/xpui.spa.spot-lyric.bak"
+  out="$("${sh[@]}" restore --no-restart --spotify-path "$path" 2>&1)"
+  check "restore without backup strips the plugin" '[[ $out == *已还原* ]] && unzip -tqq "$apps/xpui.spa" && [[ $(unzip -Z1 "$apps/xpui.spa" | grep -c "^spot-lyric/") -eq 0 && -z $(marker "$apps/xpui.spa") ]]'
+  DIGESTS+=("$name=${m1#* }")
 }
 
 DIGESTS=()
 if [[ -f "$SRC/linux/xpui.spa" ]]; then
-  for p in python zip; do
-    d="$WORK/linux-$p"; mkdir -p "$d/Apps"; cp "$SRC/linux/xpui.spa" "$d/Apps/"
-    run_unix_suite "linux" linux "$p" "$d" "$d/Apps" "$SRC/linux/xpui.spa"
-  done
+  d="$WORK/linux"; mkdir -p "$d/Apps"; cp "$SRC/linux/xpui.spa" "$d/Apps/"
+  run_unix_suite "linux" linux "$d" "$d/Apps" "$SRC/linux/xpui.spa"
 fi
 if [[ -f "$SRC/mac/Spotify.app/Contents/Resources/Apps/xpui.spa" ]]; then
   app="$WORK/Applications/Spotify.app"; mkdir -p "$app/Contents/Resources/Apps"
   cp "$SRC/mac/Spotify.app/Contents/Info.plist" "$app/Contents/" 2>/dev/null || true
   cp "$SRC/mac/Spotify.app/Contents/Resources/Apps/xpui.spa" "$app/Contents/Resources/Apps/"
-  run_unix_suite "macOS" macos zip "$app" "$app/Contents/Resources/Apps" "$SRC/mac/Spotify.app/Contents/Resources/Apps/xpui.spa"
+  run_unix_suite "macOS" macos "$app" "$app/Contents/Resources/Apps" "$SRC/mac/Spotify.app/Contents/Resources/Apps/xpui.spa"
   out="$(env SPOT_LYRIC_PLATFORM=macos "$BASH_BIN" "$ROOT/patch.sh" status --spotify-path "$app/Contents/Resources" 2>&1)"
   check "macOS: --spotify-path accepts Contents/Resources" '[[ $out == *"Spotify：$app"* ]]'
   out="$(env SPOT_LYRIC_PLATFORM=macos "$BASH_BIN" "$ROOT/patch.sh" install --yes --mode direct --no-restart --spotify-path "$app" 2>&1 || true)"
@@ -86,7 +90,7 @@ if [[ -f "$SRC/mac/Spotify.app/Contents/Resources/Apps/xpui.spa" ]]; then
 fi
 if [[ -f "$SRC/win/Apps/xpui.spa" ]]; then
   d="$WORK/win/Spotify"; mkdir -p "$d/Apps"; cp "$SRC/win/Apps/xpui.spa" "$d/Apps/"
-  run_unix_suite "windows archive" linux zip "$d" "$d/Apps" "$SRC/win/Apps/xpui.spa"
+  run_unix_suite "windows archive" linux "$d" "$d/Apps" "$SRC/win/Apps/xpui.spa"
   if [[ -n $PWSH ]]; then
     d="$WORK/win-ps/Spotify"; mkdir -p "$d/Apps"; cp "$SRC/win/Apps/xpui.spa" "$d/Apps/"
     echo "== windows (patch.ps1 via pwsh $("$PWSH" -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'))"

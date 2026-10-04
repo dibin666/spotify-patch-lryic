@@ -26,7 +26,7 @@ jobs:
       # The live test hits real NetEase / QQ APIs, which throttle datacenter addresses: run it locally.
       - run: node --test tests/core.test.mjs tests/server.test.mjs
         env: { SPOT_LYRIC_OFFLINE: '1' }
-      # patch.sh (python + zip patchers) and patch.ps1 (pwsh) on a synthetic xpui.spa.
+      # patch.sh (pure sh, python / zip / unzip shadowed) and patch.ps1 (pwsh) on a synthetic xpui.spa.
       - run: bash tests/patch_test.sh
 
   # The patch scripts on their own systems: macOS with its bash 3.2, Windows PowerShell 5.1.

@@ -166,8 +166,7 @@ privileged() {
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum | cut -c1-64; else shasum -a 256 | cut -c1-64; fi; }
 http_get() {  # http_get URL [timeout] -> body (empty on failure)
   if command -v curl >/dev/null 2>&1; then curl -fsS -m "${2:-8}" "$1" 2>/dev/null || true
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 -c 'import sys,urllib.request;print(urllib.request.urlopen(sys.argv[1],timeout=float(sys.argv[2])).read().decode())' "$1" "${2:-8}" 2>/dev/null || true
+  elif command -v wget >/dev/null 2>&1; then wget -qO- -T "${2:-8}" "$1" 2>/dev/null || true
   fi
 }
 json_version() { sed -n 's/.*"version": *"\([^"]*\)".*/\1/p'; }
@@ -271,9 +270,13 @@ build_bundle() {  # build_bundle OUT_DIR MODE SERVER
   cp "$ROOT/src/app.css" "$out/spot-lyric.css"
 }
 
-# ------------------------------------------------- patcher (zip / unzip) ---
-# Same archive layout, marker and digest as tools/xpui_patch.py and patch.ps1.
-# Used on macOS (python3 is not guaranteed there) and on Linux without python3.
+# ----------------------------------------------------- patcher (pure sh) ---
+# xpui.spa is a zip archive. It is read and rewritten with base tools only (od, awk,
+# gzip, head, tail): a zip "deflate" entry stores exactly the raw deflate stream and
+# CRC-32 that gzip produces, so no python / zip / unzip is needed. A rewrite keeps all
+# original entry data as is, appends the new index.html and plugin files and writes a
+# new central directory without the replaced entries. Restoring copies the untouched
+# backup back. Same layout, marker and digest as patch.ps1.
 ZP_BLOCK_RE='<!-- spot-lyric:start[^>]*-->.*<!-- spot-lyric:end -->'
 zp_marker() { sed -n 's/.*<!-- spot-lyric:start v\([^ ]*\) sha=\([0-9a-f]*\) -->.*/\1 \2/p' | head -n1; }
 zp_inject() {  # stdin html, $1 digest
@@ -284,8 +287,103 @@ zp_inject() {  # stdin html, $1 digest
     *) printf '%s%s' "$html" "$block" ;;
   esac
 }
-zip_patcher() {
-  local cmd="$1" apps="$2" folder spa backup html current digest stage tmp
+fsize() { local n; n="$(wc -c < "$1")"; echo $((n)); }
+zbytes() { ( set +o pipefail; tail -c +"$(( $2 + 1 ))" "$1" | head -c "$3" ); }   # file offset length
+dec() { LC_ALL=C od -An -tu1 -v; }
+# Raw little-endian integers / bytes.
+raw() { local b f=""; for b in "$@"; do f="$f$(printf '\\0%03o' "$b")"; done; printf '%b' "$f"; }
+le16() { raw $(($1 & 255)) $(($1 >> 8 & 255)); }
+le32() { raw $(($1 & 255)) $(($1 >> 8 & 255)) $(($1 >> 16 & 255)) $(($1 >> 24 & 255)); }
+# zip_eocd FILE -> "count cd_size cd_offset" of the end-of-central-directory record.
+zip_eocd() {
+  local size n; size="$(fsize "$1")"; n=$(( size < 65557 ? size : 65557 ))
+  zbytes "$1" $((size - n)) "$n" | dec | LC_ALL=C awk '
+    { for (i = 1; i <= NF; i++) b[c++] = $i }
+    END {
+      for (p = c - 22; p >= 0; p--) if (b[p] == 80 && b[p+1] == 75 && b[p+2] == 5 && b[p+3] == 6) break
+      if (p < 0) exit 1
+      count = b[p+10] + 256 * b[p+11]
+      size = b[p+12] + 256 * (b[p+13] + 256 * (b[p+14] + 256 * b[p+15]))
+      off = b[p+16] + 256 * (b[p+17] + 256 * (b[p+18] + 256 * b[p+19]))
+      if (count == 65535 || off == 4294967295) exit 2
+      print count, size, off
+    }'
+}
+# zip_central FILE CD_OFF CD_SIZE -> one line per entry:
+#   start length method crc0 crc1 crc2 crc3 csize usize local_offset name
+zip_central() {
+  zbytes "$1" "$2" "$3" | dec | LC_ALL=C awk '
+    function u16(p) { return b[p] + 256 * b[p+1] }
+    function u32(p) { return b[p] + 256 * (b[p+1] + 256 * (b[p+2] + 256 * b[p+3])) }
+    { for (i = 1; i <= NF; i++) b[c++] = $i }
+    END {
+      for (p = 0; p + 46 <= c && b[p] == 80 && b[p+1] == 75 && b[p+2] == 1 && b[p+3] == 2; p += len) {
+        n = u16(p + 28); len = 46 + n + u16(p + 30) + u16(p + 32); name = ""
+        for (i = 0; i < n; i++) name = name sprintf("%c", b[p + 46 + i])
+        print p, len, u16(p + 10), b[p+16], b[p+17], b[p+18], b[p+19], u32(p + 20), u32(p + 24), u32(p + 42), name
+      }
+    }'
+}
+# zip_read FILE NAME -> the entry contents on stdout (status 1 when missing).
+zip_read() {
+  local e start len method c0 c1 c2 c3 csize usize lho name hdr
+  e="$(zip_eocd "$1")" || return 1
+  set -- "$1" "$2" $e
+  while read -r start len method c0 c1 c2 c3 csize usize lho name; do
+    [[ $name == "$2" ]] || continue
+    hdr="$(zbytes "$1" "$lho" 30 | dec | LC_ALL=C awk '{ for (i = 1; i <= NF; i++) b[c++] = $i } END { print b[26] + 256 * b[27] + b[28] + 256 * b[29] }')"
+    case "$method" in
+      0) zbytes "$1" $((lho + 30 + hdr)) "$csize" ;;
+      8) { raw 31 139 8 0 0 0 0 0 0 255; zbytes "$1" $((lho + 30 + hdr)) "$csize"; raw "$c0" "$c1" "$c2" "$c3"; le32 "$usize"; } | gzip -dc ;;
+      *) return 1 ;;
+    esac
+    return 0
+  done < <(zip_central "$1" "$5" "$4")
+  return 1
+}
+# zip_rewrite SOURCE TARGET HTML [JS CSS]: SOURCE without index.html and spot-lyric/*,
+# plus HTML as index.html and the plugin files; written next to TARGET, then swapped in.
+zip_rewrite() {
+  local src="$1" target="$2" e count cdsize cdoff tmp cd keep start len method c0 c1 c2 c3 csize usize lho name
+  local run_start=-1 run_end=0 entry file gz gsize off crc tm dt n
+  e="$(zip_eocd "$src")" || { echo "xpui.spa: 无法读取 zip 目录（或为不支持的 ZIP64）"; return 1; }
+  read -r count cdsize cdoff <<< "$e"
+  tmp="$target.spot-lyric-$$"; cd="$tmp.cd"
+  head -c "$cdoff" "$src" > "$tmp"; : > "$cd"
+  keep=0
+  # Copy the kept central records in contiguous runs (dropped records are few).
+  while read -r start len method c0 c1 c2 c3 csize usize lho name; do
+    if [[ $name == index.html || $name == spot-lyric/* ]]; then
+      [[ $run_start -ge 0 ]] && zbytes "$src" $((cdoff + run_start)) $((run_end - run_start)) >> "$cd"
+      run_start=-1; continue
+    fi
+    [[ $run_start -lt 0 ]] && run_start=$start
+    run_end=$((start + len)); keep=$((keep + 1))
+  done < <(zip_central "$src" "$cdoff" "$cdsize")
+  [[ $run_start -ge 0 ]] && zbytes "$src" $((cdoff + run_start)) $((run_end - run_start)) >> "$cd"
+  set -- $(date '+%Y %m %d %H %M %S')
+  tm=$(( (10#$4 << 11) | (10#$5 << 5) | (10#$6 / 2) )); dt=$(( ((10#$1 - 1980) << 9) | (10#$2 << 5) | 10#$3 ))
+  set -- "index.html=$ZR_HTML" ${ZR_JS:+"spot-lyric/spot-lyric.js=$ZR_JS"} ${ZR_CSS:+"spot-lyric/spot-lyric.css=$ZR_CSS"}
+  for entry in "$@"; do
+    name="${entry%%=*}"; file="${entry#*=}"
+    gz="$tmp.gz"; gzip -n -c < "$file" > "$gz"; gsize="$(fsize "$gz")"; csize=$((gsize - 18))
+    crc="$(zbytes "$gz" $((gsize - 8)) 4 | dec)"; usize="$(fsize "$file")"; off="$(fsize "$tmp")"; n=${#name}
+    { raw 80 75 3 4; le16 20; le16 0; le16 8; le16 "$tm"; le16 "$dt"; raw $crc; le32 "$csize"; le32 "$usize"; le16 "$n"; le16 0; printf '%s' "$name"
+      zbytes "$gz" 10 "$csize"; } >> "$tmp"
+    { raw 80 75 1 2; le16 20; le16 20; le16 0; le16 8; le16 "$tm"; le16 "$dt"; raw $crc; le32 "$csize"; le32 "$usize"; le16 "$n"
+      le16 0; le16 0; le16 0; le16 0; le32 0; le32 "$off"; printf '%s' "$name"; } >> "$cd"
+    keep=$((keep + 1)); rm -f "$gz"
+  done
+  off="$(fsize "$tmp")"; cdsize="$(fsize "$cd")"
+  cat "$cd" >> "$tmp"; rm -f "$cd"
+  { raw 80 75 5 6; le16 0; le16 0; le16 "$keep"; le16 "$keep"; le32 "$cdsize"; le32 "$off"; le16 0; } >> "$tmp"
+  # Keep the owner / mode of the archive it replaces (root-owned installs stay readable).
+  chmod "$(stat -c %a "$target" 2>/dev/null || stat -f %Lp "$target" 2>/dev/null || echo 644)" "$tmp"
+  if [[ $(id -u) == 0 ]]; then chown "$(stat -c %u:%g "$target" 2>/dev/null || stat -f %u:%g "$target")" "$tmp" 2>/dev/null || true; fi
+  mv -f "$tmp" "$target"
+}
+xpui() {  # xpui <patch|restore|status> APPS [js css]
+  local cmd="$1" apps="$2" folder spa backup html current digest stage
   folder="$apps/xpui"; spa="$apps/xpui.spa"; backup="$spa.spot-lyric.bak"
   case "$cmd" in
     patch)
@@ -301,21 +399,16 @@ zip_patcher() {
         echo "PATCHED dir $folder"; return 0
       fi
       [[ -f $spa ]] || { echo "xpui.spa not found in $apps"; return 1; }
-      current="$(unzip -p "$spa" index.html | zp_marker)"
+      current="$(zip_read "$spa" index.html | zp_marker)"
       [[ $current == "$VERSION $digest" ]] && { echo "UNCHANGED spa"; return 0; }
       if [[ -z $current ]]; then cp -p "$spa" "$backup"      # fresh / freshly updated archive = new original
       else [[ -f $backup ]] || { echo "xpui.spa is patched but the backup is missing; reinstall Spotify"; return 1; }
       fi
-      stage="$(mktemp -d)"; tmp="$apps/.xpui-$$.spa"
-      mkdir -p "$stage/spot-lyric"
-      cp "$js" "$css" "$stage/spot-lyric/"
-      unzip -p "$backup" index.html | zp_inject "$digest" > "$stage/index.html"
-      cp -p "$backup" "$tmp"
-      if ! ( cd "$stage" && zip -q -X "$tmp" index.html spot-lyric/spot-lyric.js spot-lyric/spot-lyric.css ); then
-        rm -rf "$stage" "$tmp"; echo "zip failed"; return 1
-      fi
+      stage="$(mktemp -d)"
+      zip_read "$backup" index.html > "$stage/original.html" || { rm -rf "$stage"; echo "xpui.spa: 读不到 index.html"; return 1; }
+      zp_inject "$digest" < "$stage/original.html" > "$stage/index.html"
+      ZR_HTML="$stage/index.html" ZR_JS="$js" ZR_CSS="$css" zip_rewrite "$backup" "$spa" || { rm -rf "$stage"; return 1; }
       rm -rf "$stage"
-      mv -f "$tmp" "$spa"
       echo "PATCHED spa $spa" ;;
     restore)
       local restored=""
@@ -325,12 +418,12 @@ zip_patcher() {
         fi
         rm -rf "$folder/spot-lyric"
       fi
-      if [[ -f $spa && -n "$(unzip -p "$spa" index.html | zp_marker)" ]]; then
+      if [[ -f $spa && -n "$(zip_read "$spa" index.html | zp_marker)" ]]; then
         if [[ -f $backup ]]; then cp -p "$backup" "$spa.tmp" && mv -f "$spa.tmp" "$spa"
         else
           stage="$(mktemp -d)"
-          unzip -p "$spa" index.html | sed -E "s#$ZP_BLOCK_RE##" > "$stage/index.html"
-          ( cd "$stage" && zip -q -X "$spa" index.html && zip -q -d "$spa" 'spot-lyric/*' >/dev/null ) || true
+          zip_read "$spa" index.html | sed -E "s#$ZP_BLOCK_RE##" > "$stage/index.html"
+          ZR_HTML="$stage/index.html" ZR_JS="" ZR_CSS="" zip_rewrite "$spa" "$spa" || { rm -rf "$stage"; return 1; }
           rm -rf "$stage"
         fi
         restored=1
@@ -341,23 +434,11 @@ zip_patcher() {
       if [[ -f "$folder/index.html" ]]; then current="$(zp_marker < "$folder/index.html")"
         [[ -n $current ]] && echo "dir patched v$current" || echo "dir not-patched"; return 0; fi
       [[ -f $spa ]] || { echo missing; return 0; }
-      current="$(unzip -p "$spa" index.html | zp_marker)"
+      current="$(zip_read "$spa" index.html | zp_marker)"
       printf '%s%s\n' "$([[ -n $current ]] && echo "spa patched v$current" || echo "spa not-patched")" "$([[ -f $backup ]] && echo " backup")" ;;
   esac
 }
-use_python_patcher() { [[ $PLATFORM == linux && ${SPOT_LYRIC_PATCHER:-} != zip ]] && command -v python3 >/dev/null 2>&1; }
-patcher() {  # patcher <patch|restore|status> args...
-  local cmd="$1"; shift
-  if use_python_patcher; then
-    case "$cmd" in
-      patch) python3 "$ROOT/tools/xpui_patch.py" patch "$APPS" "$@" "$VERSION" ;;
-      *) python3 "$ROOT/tools/xpui_patch.py" "$cmd" "$APPS" ;;
-    esac
-  else
-    command -v unzip >/dev/null 2>&1 && command -v zip >/dev/null 2>&1 || die "需要 zip 和 unzip（或 python3）"
-    zip_patcher "$cmd" "$APPS" "$@"
-  fi
-}
+patcher() { xpui "$1" "$APPS" "${@:2}"; }   # patcher <patch|restore|status> args...
 apps_writable() {
   [[ -w "$APPS" ]] && { [[ ! -e "$APPS/xpui.spa" ]] || [[ -w "$APPS/xpui.spa" || -O "$APPS" ]]; } &&
     { [[ ! -d "$APPS/xpui" ]] || [[ -w "$APPS/xpui" ]]; }
@@ -368,7 +449,7 @@ run_patcher() {
     # Re-run this script's patcher as root with the same environment.
     say "需要管理员权限写入 Spotify 安装目录（sudo）" >&2
     if [[ $(id -u) == 0 ]]; then patcher "$@"
-    else sudo env SPOT_LYRIC_PLATFORM="$PLATFORM" SPOT_LYRIC_PATCHER="${SPOT_LYRIC_PATCHER:-}" bash "$ROOT/patch.sh" __patcher "$APPS" "$@"; fi
+    else sudo env SPOT_LYRIC_PLATFORM="$PLATFORM" bash "$ROOT/patch.sh" __patcher "$APPS" "$@"; fi
   fi
 }
 describe_patch() {

@@ -197,7 +197,7 @@ function Get-Bundle([string]$M, [string]$S) {
     $css = [IO.File]::ReadAllText((Join-Path $Root 'src\app.css'), $Utf8)
     $jsBytes = $Utf8.GetBytes($js)
     $cssBytes = $Utf8.GetBytes($css)
-    # Same digest as tools/xpui_patch.py and patch.sh: sha256(js + "\0" + css)[:16]
+    # Same digest as patch.sh: sha256(js + "\0" + css)[:16]
     $buffer = New-Object byte[] ($jsBytes.Length + 1 + $cssBytes.Length)
     [Array]::Copy($jsBytes, 0, $buffer, 0, $jsBytes.Length)
     [Array]::Copy($cssBytes, 0, $buffer, $jsBytes.Length + 1, $cssBytes.Length)

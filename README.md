@@ -26,7 +26,7 @@ macOS / Linux 运行 `patch.sh`，Windows 运行 `patch.cmd`（实际执行 `pat
 [3/3] Spotify 更新后自动重新注入？
 ```
 
-注入由脚本自己完成，不需要额外程序。只有选择「纯本地 · 本地服务」时，才会获取本地服务程序 `spot-lyric-server`：本机装了 Go 就从源码编译，否则下载 CI 编译好的对应版本（GitHub Releases `v<VERSION>`，带 SHA256 校验）。
+注入由脚本自己完成，不需要额外程序：`patch.sh` 只用系统自带的工具（bash、gzip、od、awk、curl，macOS 自带的 bash 3.2 即可），不需要 python、zip / unzip；`patch.ps1` 只用 Windows 自带的 PowerShell 5.1。只有选择「纯本地 · 本地服务」时，才会获取本地服务程序 `spot-lyric-server`：本机装了 Go 就从源码编译，否则下载 CI 编译好的对应版本（GitHub Releases `v<VERSION>`，带 SHA256 校验）。
 
 > Windows 不支持 Microsoft Store 版 Spotify，请从官网下载安装。Spotify 自动更新后重新运行即可，选了「自动重新注入」的话会自己处理。
 
@@ -127,7 +127,6 @@ docker compose up -d --build
 
 ```
 patch.sh / patch.ps1   注入 Spotify、分步引导、直连、本地服务安装、钩子（两者行为一致）
-tools/xpui_patch.py    Linux 有 python3 时 patch.sh 使用的注入实现（否则用 zip / unzip）
 src/                   注入到 Spotify 的插件
 server/                歌词服务器（存储 + 转发），也是纯本地模式的本地服务
 cmd/spot-lyric-server/ 服务端程序入口：serve [--local]、healthcheck、version
@@ -136,7 +135,7 @@ cmd/spot-lyric-server/ 服务端程序入口：serve [--local]、healthcheck、v
 ```bash
 go vet ./... && go test ./...                      # 服务端
 SPOT_LYRIC_OFFLINE=1 node --test tests/            # 插件匹配引擎 + 服务器端到端
-tests/patch_test.sh [解包的安装包目录]               # patch.sh（python / zip）与 patch.ps1（pwsh）注入 / 还原
+tests/patch_test.sh [解包的安装包目录]               # patch.sh 与 patch.ps1（pwsh）注入 / 还原
 powershell -File tests\patch_test.ps1              # Windows PowerShell 5.1 下的 patch.ps1
 ```
 
