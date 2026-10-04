@@ -136,4 +136,4 @@ SPOT_LYRIC_OFFLINE=1 node --test tests/            # 插件匹配引擎 + 服务
 tests/patch_test.sh <解包的安装包目录>                # 用真实 xpui.spa 测试注入 / 还原
 ```
 
-CI 每次推送都会交叉编译 6 个目标（Windows / macOS / Linux × amd64 / arm64），并发布到 Release `v<VERSION>`。修改 `VERSION` 即发布新版本。
+CI 每次推送都会在 6 个原生 runner（Windows / macOS / Linux × amd64 / arm64）上分别测试并编译，然后发布到 Release `v<VERSION>`。修改 `VERSION` 即发布新版本。

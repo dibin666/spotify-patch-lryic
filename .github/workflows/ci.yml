@@ -23,41 +23,59 @@ jobs:
       - uses: actions/setup-go@v5
         with: { go-version: '1.24' }
       - run: go vet ./... && go test ./...
-      # Every target the release ships must at least compile (and vet) on its system.
-      - run: for os in windows darwin; do GOOS=$os go vet ./...; done
       # The live test hits real NetEase / QQ APIs, which throttle datacenter addresses: run it locally.
       - run: node --test tests/core.test.mjs tests/server.test.mjs
         env: { SPOT_LYRIC_OFFLINE: '1' }
 
-  # spot-lyric for every system (patcher + local service + server in one program), published as
-  # release v<VERSION>: created by the first push of a version, assets refreshed by later pushes.
-  # patch.sh / patch.ps1 download these when Go is not installed.
+  # spot-lyric for every system (patcher + local service + server in one program), each built
+  # and tested on a native runner of its own system / architecture.
   binaries:
     needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,    asset: spot-lyric-linux-amd64 }
+          - { runner: ubuntu-24.04-arm, asset: spot-lyric-linux-arm64 }
+          - { runner: macos-15-intel,   asset: spot-lyric-darwin-amd64 }
+          - { runner: macos-latest,     asset: spot-lyric-darwin-arm64 }
+          - { runner: windows-latest,   asset: spot-lyric-windows-amd64.exe }
+          - { runner: windows-11-arm,   asset: spot-lyric-windows-arm64.exe }
+    runs-on: ${{ matrix.runner }}
+    env:
+      CGO_ENABLED: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: false
+      - run: go test ./...
+      - run: go build -trimpath -ldflags "-s -w" -o dist/${{ matrix.asset }} ./cmd/spot-lyric
+      - run: ./dist/${{ matrix.asset }} version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  # Release v<VERSION>: created by the first push of a version, assets refreshed by later pushes.
+  # patch.sh / patch.ps1 download these when Go is not installed.
+  release:
+    needs: binaries
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with: { go-version: '1.24' }
-      - name: Cross-compile
-        run: |
-          mkdir -p dist
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
-            os=${target%/*}; arch=${target#*/}; ext=""
-            [ "$os" = windows ] && ext=.exe
-            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -ldflags "-s -w" -o "dist/spot-lyric-$os-$arch$ext" ./cmd/spot-lyric
-          done
-          (cd dist && sha256sum spot-lyric-* > SHA256SUMS && cat SHA256SUMS)
-          ./dist/spot-lyric-linux-amd64 version
-      - uses: actions/upload-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: spot-lyric-binaries
-          path: dist/*
-          if-no-files-found: error
+          path: dist
+          pattern: spot-lyric-*
+          merge-multiple: true
+      - run: cd dist && sha256sum spot-lyric-* > SHA256SUMS && cat SHA256SUMS
       - name: Publish release
-        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}

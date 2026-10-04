@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -216,6 +217,9 @@ func TestPatchDirectory(t *testing.T) {
 }
 
 func TestLinuxDirectDesktopEntry(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Linux launcher entries (symlinks, desktop-file quoting)")
+	}
 	home := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	system := filepath.Join(home, "system.desktop")
