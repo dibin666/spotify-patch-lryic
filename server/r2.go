@@ -1,4 +1,4 @@
-package main
+package server
 
 // Minimal S3 client (AWS Signature V4) for Cloudflare R2 or any S3-compatible
 // storage: PUT / GET / DELETE of one object.

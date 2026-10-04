@@ -1,6 +1,7 @@
-// Lyrics server (storage + relay, Go binary in server/) and the client engine that uses it, end to end,
-// with fake NetEase / QQ on the client side and the server's local-directory storage.
-//   node --test tests/        (needs Go; builds server/ once)
+// Lyrics server (storage + relay: `spot-lyric serve`, Go code in server/) and the client engine
+// that uses it, end to end, with fake NetEase / QQ on the client side and the server's
+// local-directory storage. Also covers pure local mode (no lyrics server).
+//   node --test tests/        (needs Go; builds cmd/spot-lyric once)
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -14,9 +15,9 @@ import { MemoryStore } from './memory-store.mjs';
 const require = createRequire(import.meta.url);
 const core = require('../src/core.js');
 
-const serverDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '../server');
-const binary = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'spot-lyric-bin-')), 'server');
-execFileSync('go', ['build', '-o', binary, '.'], { cwd: serverDir, env: { ...process.env, CGO_ENABLED: '0' } });
+const repoDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const binary = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'spot-lyric-bin-')), 'spot-lyric');
+execFileSync('go', ['build', '-o', binary, './cmd/spot-lyric'], { cwd: repoDir, env: { ...process.env, CGO_ENABLED: '0' } });
 
 const lrc = list => list.map((t, i) => `[00:${String(10 + i * 3).padStart(2, '0')}.00]${t}`).join('\n');
 const SONGS = {
@@ -48,7 +49,7 @@ async function start(options = {}) {
   const env = { PATH: process.env.PATH, HOST: '127.0.0.1', PORT: String(port), DATA_DIR: dataDir, LOG_REQUESTS: '0' };
   if (options.token) env.API_TOKEN = options.token;
   if (options.relay === false) env.RELAY = '0';
-  const child = spawn(binary, [], { env, stdio: 'ignore' });
+  const child = spawn(binary, ['serve'], { env, stdio: 'ignore' });
   const base = `http://127.0.0.1:${port}`;
   for (let i = 0; ; i++) {
     try { if ((await fetch(`${base}/health`)).ok) break; } catch (_) { /* not up yet */ }
@@ -225,4 +226,25 @@ test('local files stay on the client; origin allow-list and optional token', asy
   await authorized.setTrack(SUNNY);
   await authorized.upload();
   assert.equal(s.bucket.puts, 1);
+});
+
+test('pure local mode: no lyrics server is contacted; bindings stay on this machine', async (t) => {
+  const s = await start(); t.after(s.close);
+  const local = [];
+  const engine = new core.Engine({ store: new MemoryStore(), http: new core.Http(providers(local)), cloud: null, settings: () => ({ preferred_provider: 'netease' }) });
+  await engine.setTrack(SUNNY);
+  assert.equal(engine.status, '已匹配歌词 · 网易云音乐');
+  const [first, second] = (await engine.search('晴天 周杰伦')).providers[0].candidates;
+  const result = await engine.bind(second, await engine.preview(second));
+  assert.equal(result.offline, true);
+  assert.equal(engine.origin, 'manual');
+  assert.equal(engine.lyrics.lines[0].text, '第二个版本');
+  await assert.rejects(engine.upload(), /纯本地/);
+  // The binding survives a track change on this machine.
+  await engine.setTrack(null);
+  await engine.setTrack(SUNNY);
+  assert.equal(engine.match.id, second.id);
+  await engine.unbind();
+  assert.equal(engine.match.id, first.id, 'unbind rematches automatically');
+  assert.equal(s.bucket.puts, 0, 'nothing reached a server');
 });

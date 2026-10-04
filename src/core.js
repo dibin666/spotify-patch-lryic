@@ -752,8 +752,9 @@
   const trackPayload = t => ({ uri: t.uri || '', title: t.title || '', artists: (t.artists || []).slice(0, 20), album: t.album || '', duration_ms: t.duration_ms || 0 });
 
   /* Runs entirely on the client: NetEase / QQ requests go through deps.http (direct, or
-   * relayed by the lyrics server when the renderer may not reach them); the lyrics
-   * server (deps.cloud) only stores matches and lyrics that users chose or uploaded. */
+   * relayed by the lyrics server / local service when the renderer may not reach them);
+   * the lyrics server (deps.cloud) only stores matches and lyrics that users chose or
+   * uploaded. Without deps.cloud (pure local mode) everything stays on this machine. */
   class Engine {
     /**
      * deps: { store, http: Http, cloud?: Cloud, settings(): {preferred_provider, spotify_first, verify_lyrics},
@@ -1054,11 +1055,12 @@
         return fresh;
       } catch (e) { if (e.kind === 'cancelled') throw CANCELLED; return doc.lyrics; }
     }
-    /** @returns {Promise<{stored?: string, updated_at?: string, local?: boolean, error?: string}>} */
+    /** local: not a Spotify track; offline: pure local mode (no lyrics server).
+     * @returns {Promise<{stored?: string, updated_at?: string, local?: boolean, offline?: boolean, error?: string}>} */
     async _upload(track, candidate, lyrics) {
       const id = spotifyId(track.uri);
       if (!id) return { local: true };
-      if (!this.cloud) return { error: '未配置歌词服务器' };
+      if (!this.cloud) return { offline: true };
       try {
         const answer = await this.cloud.put(trackPayload(track), candidate, lyrics);
         await this.store.cachePut(CLOUD_CACHE + id, JSON.stringify(answer.binding || null), CLOUD_TTL);
@@ -1071,6 +1073,7 @@
       if (!track || !lyricsUsable(lyrics)) throw new ProviderError('当前没有可上传的歌词', 'failed');
       if (lyrics.source === 'spotify') throw new ProviderError('Spotify 官方歌词受版权保护，不上传到服务器', 'denied');
       if (!spotifyId(track.uri)) throw new ProviderError('本地文件没有 Spotify 曲目 ID，无法上传', 'denied');
+      if (!this.cloud) throw new ProviderError('纯本地模式不连接歌词服务器', 'denied');
       const result = await this._upload(track, this.match, lyrics);
       if (result.error) throw new ProviderError(result.error, 'failed');
       if (this.track === track) { this.origin = 'cloud'; this._changed(); }

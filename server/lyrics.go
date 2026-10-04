@@ -1,4 +1,4 @@
-package main
+package server
 
 // Input validation for data received from clients; port of the relevant parts
 // of src/core.js (spotifyId, candidateFromJson, candidateJson, sanitizeLyrics,

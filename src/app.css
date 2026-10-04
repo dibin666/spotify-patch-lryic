@@ -19,6 +19,7 @@
   width: 24px; height: 32px; padding: 0; margin: 0 -2px 0 0; border: 0; border-radius: 4px; background: none;
   color: var(--text-subdued, #b3b3b3); cursor: pointer; opacity: .8; transition: color .15s, opacity .15s, transform .1s;
 }
+.sl-upload[hidden] { display: none; }
 .sl-upload .sl-upload-icon { display: inline-flex; pointer-events: none; }
 .sl-upload:hover { color: var(--text-base, #fff); opacity: 1; transform: scale(1.06); }
 .sl-upload:focus-visible { outline: 2px solid #fff; outline-offset: -2px; }

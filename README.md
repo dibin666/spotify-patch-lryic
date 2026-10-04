@@ -1,97 +1,113 @@
 # Spot-Lyric for Spotify
 
-Spotify 桌面客户端第三方歌词插件（支持 Windows / macOS / Linux）。  
-采用原生 UI 风格，接入网易云音乐与 QQ 音乐（官方兜底），支持逐字高亮、双语翻译与跨设备云端同步。
+Spotify 桌面客户端的第三方歌词插件，支持 Windows / macOS / Linux。  
+界面沿用 Spotify 原生风格，歌词来自网易云音乐和 QQ 音乐（Spotify 官方歌词兜底），支持逐字高亮、双语翻译。可以用云端服务器共享歌词，也可以纯本地使用，不连接任何远程服务器。
 
 ---
 
 ## 特性
 
-- **原生质感**：深度融合 Spotify 官方界面，自适应封面配色与动态字号。
-- **多源歌词**：支持网易云、QQ 音乐与官方歌词兜底，支持逐字歌词与翻译。
-- **精准匹配**：参考 Lyricify、LDDC 的匹配方式——繁简归一、版本标签（Live / Remix / Inst / xxx ver.）、多艺术家与「角色 (CV:声优)」别名、分级时长、缺失字段重新加权、逐步放宽的搜索词；跨语言艺术家（Eason Chan / 陈奕迅）用 Spotify 歌词正文核对。
-- **本地匹配**：搜索、评分、歌词下载和解析都在本机进行；服务器只保存匹配与歌词。
-- **云端共享**：「使用此歌词」或播放栏歌词图标旁的小箭头把当前歌词上传到服务器，所有设备直接使用。
+- **原生质感**：深度融入 Spotify 官方界面，背景色跟随封面，字号自动适配。
+- **多源歌词**：网易云、QQ 音乐，Spotify 官方歌词兜底；支持逐字歌词和翻译。
+- **精准匹配**：参考 Lyricify、LDDC 的做法，包括：繁简归一；识别版本标签（Live / Remix / Inst / xxx ver.）；多艺术家和「角色 (CV:声优)」别名；按时长差分级打分；缺失字段时重新分配权重；搜索词逐步放宽。艺术家名跨语言时（如 Eason Chan / 陈奕迅），用 Spotify 歌词正文核对。
+- **本地匹配**：搜索、评分、歌词下载和解析都在本机完成。
+- **三种使用方式**：云端服务器（多设备共享）、纯本地 · 本地服务、纯本地 · 直连，安装时按提示一步步选择。
 - **背景**：柔和封面取色 / 封面模糊 / 深色。
 
 ---
 
 ## 快速安装
 
-> **注意**：Windows 不支持 Microsoft Store 商店版（请从官网下载安装）。Spotify 自动更新后重新运行脚本即可（或使用 `hook` 自动重注）。
+三个系统用的是同一个程序 `spot-lyric`，命令和参数完全一样。直接运行（不带参数）就会一步步引导：
+
+```
+[1/3] 选择使用方式              云端服务器 / 纯本地
+[2/3] 纯本地：请求怎么发出？      本地服务 / 直连        （云端则填写歌词服务器地址）
+[3/3] Spotify 更新后自动重新注入？
+```
+
+> Windows 不支持 Microsoft Store 版 Spotify，请从官网下载安装。Spotify 自动更新后重新运行即可，选了「自动重新注入」的话会自己处理。
 
 ### 一键安装（无需克隆仓库）
-
-脚本会下载最新代码到临时目录并运行，命令后面可直接追加参数（如 `restore`、`status`、`--server ...`）。
 
 **macOS / Linux**
 
 ```bash
-d=$(mktemp -d) && curl -fsSL https://github.com/dibin666/spotify-patch-lryic/archive/refs/heads/main.tar.gz | tar xz -C "$d" --strip-components=1 && bash "$d/patch.sh"
-# 追加参数示例：... && bash "$d/patch.sh" restore
+curl -fsSL https://raw.githubusercontent.com/dibin666/spotify-patch-lryic/main/patch.sh | bash
+# 带参数：... | bash -s -- --mode local
 ```
 
 **Windows**（PowerShell）
 
 ```powershell
-$d="$env:TEMP\spot-lyric"; Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue; Invoke-WebRequest https://github.com/dibin666/spotify-patch-lryic/archive/refs/heads/main.zip -OutFile "$d.zip"; Expand-Archive "$d.zip" $d -Force; & "$d\spotify-patch-lryic-main\patch.ps1"
-# 追加参数示例：... patch.ps1 restore    或    patch.ps1 -Server https://lyrics.example.com
+irm https://raw.githubusercontent.com/dibin666/spotify-patch-lryic/main/patch.ps1 | iex
+# 带参数：& ([scriptblock]::Create((irm https://raw.githubusercontent.com/dibin666/spotify-patch-lryic/main/patch.ps1))) --mode local
 ```
 
-`hook` 会把所需文件复制到固定位置，所以用一键方式执行 `hook` 后，临时目录删除也不影响自动重新注入。
-
-### Windows
-
-双击运行 `patch.cmd`，或在终端执行：
-
-```bat
-patch.cmd             :: 注入安装（自动重启 Spotify）
-patch.cmd restore     :: 还原官方客户端
-patch.cmd hook        :: 可选：开机/登录时自动检查并重新注入
-```
-
-### macOS / Linux
-
-在终端执行：
+### 在仓库目录中
 
 ```bash
-./patch.sh            # 注入安装（macOS 会自动重签名）
-./patch.sh restore    # 还原官方客户端
-./patch.sh hook       # 可选：系统或应用更新后自动重新注入
+./patch.sh            # macOS / Linux
+patch.cmd             # Windows（双击也可以）
 ```
 
-- 指定自建服务器：`./patch.sh --server https://lyrics.example.com`（Windows：`patch.cmd -Server ...`）
-- 指定安装路径：`./patch.sh --spotify-path /path/to/Spotify`
-- 本机直连网易云 / QQ 音乐：`./patch.sh --direct`（Windows：`patch.cmd -Direct`，取消用 `--no-direct` / `-NoDirect`）
+`patch.sh`、`patch.cmd` 和 `patch.ps1` 只是启动器，所有参数都原样交给 `spot-lyric`。本机装了 Go 时，从当前源码编译；否则下载 CI 编译好的对应版本（GitHub Releases `v<VERSION>`，带 SHA256 校验）。
 
-### 网易云 / QQ 音乐请求怎么发出
+---
 
-Spotify 内置浏览器强制 CORS，而网易云 / QQ 音乐的接口不允许跨域读取，所以：
+## 使用方式
 
-- **默认**：插件先尝试直连，被拦截后把自己构造好的请求交给歌词服务器原样转发（仅白名单域名与接口），匹配仍在本机。
-- **`--direct`**：以 `--disable-web-security --user-data-dir=<配置目录副本>` 启动 Spotify（新版 Chromium 要求同时指定非默认的 `--user-data-dir` 才允许关闭同源限制；Linux 用符号链接 `~/.config/spotify-direct` 指向原配置目录，登录状态不变；Windows 使用 `%LOCALAPPDATA%\Spotify\DirectProfile`，首次可能需要重新登录 / 重设插件选项），请求全部从本机发出，不经过服务器。该参数会关闭 Spotify 内置浏览器的同源限制；Linux 写入 `~/.local/share/applications/spotify.desktop`，Windows 修改 Spotify 快捷方式与开机自启项，macOS 不支持（自动使用转发）。从其它入口启动时未带参数也没关系，会自动改用转发。
+Spotify 内置浏览器会强制执行 CORS，而网易云 / QQ 音乐的接口不允许跨域读取，所以插件需要通过下面三种方式之一把请求发出去：
 
-「歌词设置 > 歌词服务器 > 网络」显示当前方式，也可关闭服务器转发。
+| 方式 | `--mode` | 远程服务器 | 网易云 / QQ 请求 | 系统 |
+| --- | --- | --- | --- | --- |
+| 云端服务器（默认） | `cloud` | 保存共享的匹配和歌词 | 先尝试直连，被拦截后由歌词服务器原样转发（只转发白名单域名和接口） | 全部 |
+| 纯本地 · 本地服务 | `local` | 无 | 由本机 `127.0.0.1:38917` 的本地服务转发 | 全部 |
+| 纯本地 · 直连 | `direct` | 无 | Spotify 以 `--disable-web-security` 启动，请求直接从内置浏览器发出 | Windows / Linux |
+
+不管哪种方式，匹配都在本机完成，「使用此歌词」也会保存在本机。只有云端模式会把它上传到服务器，供所有设备共享；播放栏歌词图标旁的上传按钮也只在云端模式下出现。
+
+**本地服务**就是 `spot-lyric serve --local`：只监听 `127.0.0.1`，只接受 Spotify 页面的请求，只转发白名单接口，内存占用约 10 MB，登录后自动启动：
+
+| 系统 | 自启方式 | 程序与日志 |
+| --- | --- | --- |
+| Linux | systemd 用户服务 `spot-lyric-local.service`（没有 systemd 时用 XDG 自启） | `~/.local/share/spot-lyric/` |
+| macOS | LaunchAgent `com.spotlyric.local` | `~/Library/Application Support/SpotLyric/` |
+| Windows | 登录启动项 `SpotLyricLocal`（隐藏窗口） | `%LOCALAPPDATA%\SpotLyric\` |
+
+**直连**会关闭 Spotify 内置浏览器的同源限制。新版 Chromium 要求同时指定一个非默认的 `--user-data-dir`：Linux 用符号链接 `~/.config/spotify-direct` 指向原配置目录，登录状态不受影响，并写入 `~/.local/share/applications/spotify.desktop`；Windows 使用 `%LOCALAPPDATA%\Spotify\DirectProfile`，并修改 Spotify 快捷方式和开机自启项，首次启动可能需要重新登录。macOS 无法给从 Dock / 启动台打开的 Spotify 加启动参数，所以不支持这种方式，请改用本地服务。
+
+在 Spotify 里，「歌词设置 > 使用方式与网络」会显示当前的方式和网络状态，也可以在云端和纯本地之间临时切换。重新运行安装程序会以安装时的选择为准。
 
 ---
 
 ## 命令速查
 
-| 操作 | macOS / Linux | Windows |
-| --- | --- | --- |
-| 安装 / 更新 | `./patch.sh` | `patch.cmd` |
-| 运行状态 | `./patch.sh status` | `patch.cmd status` |
-| 还原官方 | `./patch.sh restore` | `patch.cmd restore` |
-| 彻底卸载 | `./patch.sh uninstall` | `patch.cmd uninstall` |
-| 自动重注 | `./patch.sh hook` | `patch.cmd hook` |
+下面都以 `./patch.sh` 为例。Windows 换成 `patch.cmd`，直接运行 `spot-lyric` 程序也一样。
+
+| 操作 | 命令 |
+| --- | --- |
+| 引导安装 / 更新 / 更换使用方式 | `./patch.sh` |
+| 不询问，直接用纯本地 · 本地服务 | `./patch.sh --mode local -y` |
+| 不询问，直接用纯本地 · 直连 | `./patch.sh --mode direct -y` |
+| 不询问，使用自建服务器 | `./patch.sh --server https://lyrics.example.com -y` |
+| 运行状态 | `./patch.sh status` |
+| 只重新注入（沿用上次的方式） | `./patch.sh apply` |
+| 还原官方客户端 | `./patch.sh restore` |
+| 彻底卸载（含钩子、本地服务、直连参数） | `./patch.sh uninstall` |
+| 安装 / 移除自动重新注入 | `./patch.sh hook` / `./patch.sh unhook` |
+
+常用选项：`--spotify-path P`（手动指定 Spotify 位置；macOS 填 Spotify.app）、`--hook` / `--no-hook`、`--restart` / `--no-restart`、`-y`（不询问）、`-q`（安静模式）。完整说明见 `./patch.sh --help`。旧版的 `-Server`、`-NoRestart`、`-SpotifyPath` 等写法仍然有效；`--direct` / `-Direct` 现在表示「纯本地 · 直连」。
+
+macOS 注入后会自动重新签名（ad-hoc）。Linux 的 Spotify 装在系统目录时，写入这一步会通过 sudo 请求权限，请不要直接用 sudo 运行整个程序。
 
 ---
 
-## 自建歌词服务器（可选）
+## 自建歌词服务器（可选，云端模式）
 
-服务器只做两件事：保存共享的匹配与歌词（每个 Spotify 曲目一个 R2 对象，最新上传生效；Spotify 官方歌词不会被上传），以及白名单转发（`RELAY=0` 可关闭）。v1.2 起不再在服务器上匹配，旧版客户端需重新运行 patch 脚本更新。
+服务器只做两件事：保存共享的匹配和歌词（每个 Spotify 曲目对应一个 R2 对象，以最新上传为准；Spotify 官方歌词不会被上传），以及白名单转发（`RELAY=0` 可关闭）。
 
-默认使用公共服务器（`https://spo.564616.xyz`），亦可通过 Docker 自建：
+默认使用公共服务器（`https://spo.564616.xyz`），也可以用 Docker 自建：
 
 ```bash
 cd server
@@ -99,5 +115,25 @@ cp .env.example .env    # 按需配置存储（支持 Cloudflare R2 / S3 / 本�
 docker compose up -d --build
 ```
 
-- 验证服务：`curl http://127.0.0.1:38917/health`，完整自检：`tools/server-smoke.sh http://127.0.0.1:38917`
-- 安装时指定服务器或在客户端「歌词设置 > 歌词服务器」中修改。
+- 验证服务：`curl http://127.0.0.1:38917/health`；完整自检：`tools/server-smoke.sh http://127.0.0.1:38917`
+- 在安装引导中填写服务器地址，或在客户端「歌词设置 > 使用方式与网络」中修改。
+- 镜像里运行的也是 `spot-lyric`（`serve` 命令）。
+
+---
+
+## 开发
+
+```
+cmd/spot-lyric/   程序入口：patch（install / apply / …）与 serve
+patcher/          注入 Spotify、引导安装、直连、本地服务、钩子
+server/           歌词服务器（存储 + 转发），也是本地服务
+src/              注入到 Spotify 的插件（编译时内嵌进程序）
+```
+
+```bash
+go vet ./... && go test ./...                      # Go：patcher + server
+SPOT_LYRIC_OFFLINE=1 node --test tests/            # 插件匹配引擎 + 服务器端到端
+tests/patch_test.sh <解包的安装包目录>                # 用真实 xpui.spa 测试注入 / 还原
+```
+
+CI 每次推送都会交叉编译 6 个目标（Windows / macOS / Linux × amd64 / arm64），并发布到 Release `v<VERSION>`。修改 `VERSION` 即发布新版本。

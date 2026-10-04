@@ -1,4 +1,4 @@
-package main
+package server
 
 /*
  * Spot-Lyric lyrics server.
@@ -37,7 +37,7 @@ import (
 	"time"
 )
 
-var version = "0.0.0" // set with -ldflags "-X main.version=..."
+var version = "0.0.0" // set by the program (SetVersion) from the embedded VERSION file
 
 const maxBody = 2 * 1024 * 1024 // word-timed lyrics with translations stay well below this
 
@@ -408,6 +408,10 @@ func (a *App) respond(w http.ResponseWriter, r *http.Request, status int, payloa
 		h.Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		h.Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		h.Set("Access-Control-Max-Age", "86400")
+		/* Private Network Access: the Spotify renderer may ask before calling the local service on 127.0.0.1. */
+		if r.Header.Get("Access-Control-Request-Private-Network") == "true" {
+			h.Set("Access-Control-Allow-Private-Network", "true")
+		}
 	}
 	w.WriteHeader(status)
 	if empty {

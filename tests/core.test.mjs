@@ -267,7 +267,8 @@ test('engine: manual search, bind and unbind (offline)', async () => {
   const preview = await engine.preview(candidate);
   const bound = await engine.bind(candidate, preview);
   assert.equal(engine.status, '已绑定歌词 · 网易云音乐');
-  assert.match(bound.error, /未配置歌词服务器/, 'no lyrics server: bound on this machine only');
+  assert.equal(bound.offline, true, 'no lyrics server (pure local): bound on this machine only');
+  assert.equal(bound.error, undefined);
   await engine.setTrack({ ...track, title: 'x' }); await engine.setTrack(track);
   assert.equal(engine.status, '已绑定歌词 · 缓存');
   assert.equal((await engine.search('Other Z')).providers[0].candidates[0].bound, true);

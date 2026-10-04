@@ -1,4 +1,4 @@
-package main
+package server
 
 // Relay of provider requests built by the client. Only a fixed allow-list of
 // NetEase / QQ Music hosts and API paths can be reached, redirects are not

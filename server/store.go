@@ -1,4 +1,4 @@
-package main
+package server
 
 // Storage: one JSON object per Spotify track in object storage (R2 / S3), with a
 // bounded in-memory LRU cache. A local directory is used when no bucket is set.
