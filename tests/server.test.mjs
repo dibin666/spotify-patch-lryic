@@ -1,20 +1,22 @@
-// Lyrics server (storage + relay) and the client engine that uses it, end to end,
-// with fake NetEase / QQ and an in-memory bucket.   node --test tests/
+// Lyrics server (storage + relay, Go binary in server/) and the client engine that uses it, end to end,
+// with fake NetEase / QQ on the client side and the server's local-directory storage.
+//   node --test tests/        (needs Go; builds server/ once)
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
+import { spawn, execFileSync } from 'node:child_process';
+import { createServer } from 'node:net';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { MemoryStore } from './memory-store.mjs';
 const require = createRequire(import.meta.url);
 const core = require('../src/core.js');
-const { createApp } = require('../server/src/server.js');
-const { relayAllowed } = require('../server/src/upstream.js');
 
-class MemoryBucket {
-  constructor() { this.objects = new Map(); this.puts = 0; }
-  async put(key, body, type, metadata) { this.puts++; this.objects.set(key, { body, type, metadata }); }
-  async get(key) { const o = this.objects.get(key); return o ? o.body : null; }
-  async delete(key) { this.objects.delete(key); }
-}
+const serverDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '../server');
+const binary = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'spot-lyric-bin-')), 'server');
+execFileSync('go', ['build', '-o', binary, '.'], { cwd: serverDir, env: { ...process.env, CGO_ENABLED: '0' } });
 
 const lrc = list => list.map((t, i) => `[00:${String(10 + i * 3).padStart(2, '0')}.00]${t}`).join('\n');
 const SONGS = {
@@ -38,13 +40,31 @@ function providers(calls) {
   };
 }
 
+const freePort = () => new Promise(resolve => { const srv = createServer(); srv.listen(0, '127.0.0.1', () => { const { port } = srv.address(); srv.close(() => resolve(port)); }); });
+
 async function start(options = {}) {
-  const calls = [];
-  const bucket = new MemoryBucket();
-  const app = createApp({ env: {}, bucket, transport: providers(calls), config: { port: 0, host: '127.0.0.1', logRequests: false, ...options } });
-  const address = await app.listen();
-  const base = `http://127.0.0.1:${address.port}`;
-  return { app, bucket, calls, base, close: () => app.close() };
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'spot-lyric-data-'));
+  const port = await freePort();
+  const env = { PATH: process.env.PATH, HOST: '127.0.0.1', PORT: String(port), DATA_DIR: dataDir, LOG_REQUESTS: '0' };
+  if (options.token) env.API_TOKEN = options.token;
+  if (options.relay === false) env.RELAY = '0';
+  const child = spawn(binary, [], { env, stdio: 'ignore' });
+  const base = `http://127.0.0.1:${port}`;
+  for (let i = 0; ; i++) {
+    try { if ((await fetch(`${base}/health`)).ok) break; } catch (_) { /* not up yet */ }
+    if (i > 100) throw new Error('server did not start');
+    await new Promise(r => setTimeout(r, 50));
+  }
+  const objects = path.join(dataDir, 'objects');
+  const files = () => { try { return fs.readdirSync(path.join(objects, 'lyrics')).filter(f => f.endsWith('.json')); } catch (_) { return []; } };
+  const bucket = {
+    objects: {
+      get: key => { try { return { body: fs.readFileSync(path.join(objects, key), 'utf8') }; } catch (_) { return undefined; } },
+      get size() { return files().length; },
+    },
+    get puts() { return files().length; },
+  };
+  return { bucket, base, close: async () => { child.kill(); fs.rmSync(dataDir, { recursive: true, force: true }); } };
 }
 
 function serverTransport(base, headers = {}) {
@@ -72,23 +92,16 @@ test('client: matching runs locally, the server only stores; automatic results a
   assert.equal(engine.lyrics.lines[0].text, '故事的小黄花');
   assert.equal(engine.match.id, '7');
   assert.ok(local.length >= 2, 'NetEase / QQ were requested by the client');
-  assert.equal(s.calls.length, 0, 'the server never contacted a provider');
   assert.equal(s.bucket.puts, 0, 'nothing stored without a manual choice');
 });
 
-test('client: provider requests are relayed by the server when direct access is blocked', async (t) => {
+test('relay: only the allow-list is forwarded; RELAY=0 turns it off', async (t) => {
   const s = await start(); t.after(s.close);
-  const engine = client(s.base, { relay: true });
-  await engine.setTrack(SUNNY);
-  assert.equal(engine.status, '已匹配歌词 · 网易云音乐');
-  assert.ok(s.calls.some(u => u.includes('/api/search/get/web')) && s.calls.some(u => u.includes('/api/song/lyric')));
   // Only the allow-list is forwarded.
   const post = body => fetch(`${s.base}/api/relay`, { method: 'POST', body: JSON.stringify(body) });
   assert.equal((await post({ method: 'GET', url: 'https://evil.example/api/search/get/web' })).status, 400);
   assert.equal((await post({ method: 'GET', url: 'https://music.163.com/weapi/user/account' })).status, 400);
   assert.equal((await post({ method: 'DELETE', url: 'https://music.163.com/api/song/lyric?id=1' })).status, 400);
-  assert.equal(relayAllowed('GET', 'https://music.163.com:8443/api/song/lyric'), false);
-  assert.equal(relayAllowed('POST', 'https://u.y.qq.com/cgi-bin/musicu.fcg'), true);
   // RELAY=0 turns forwarding off.
   const off = await start({ relay: false }); t.after(off.close);
   assert.equal((await fetch(`${off.base}/api/relay`, { method: 'POST', body: JSON.stringify({ method: 'GET', url: 'https://music.163.com/api/song/lyric?id=7' }) })).status, 403);
@@ -105,7 +118,7 @@ test('"使用此歌词" uploads match + lyrics; the latest choice wins; other cl
   const preview = await engine.preview(first);
   assert.equal(preview.lines[0].text, '故事的小黄花');
 
-  assert.equal((await engine.bind(first, preview)).stored, 'r2');
+  assert.equal((await engine.bind(first, preview)).stored, 'local');
   assert.equal(engine.origin, 'cloud');
   let doc = JSON.parse(s.bucket.objects.get(KEY).body);
   assert.equal(doc.spotify_url, 'https://open.spotify.com/track/0RiRZpuVRbi7oqRdSMwhQY');
@@ -113,7 +126,6 @@ test('"使用此歌词" uploads match + lyrics; the latest choice wins; other cl
   assert.equal(doc.match.url, `https://music.163.com/#/song?id=${first.id}`);
   assert.match(doc.lrc, /故事的小黄花/);
   assert.equal(doc.lyrics.lines[0].text, '故事的小黄花');
-  assert.equal(s.bucket.objects.get(KEY).metadata['spotify-url'], doc.spotify_url);
 
   // Switching lyrics overwrites the same object.
   await engine.bind(second, await engine.preview(second));

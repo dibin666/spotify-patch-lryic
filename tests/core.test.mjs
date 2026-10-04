@@ -306,9 +306,14 @@ test('engine: cross-script artists are confirmed by lyric text; instrumental is 
 
 const live = process.env.SPOT_LYRIC_OFFLINE ? test.skip : test;
 live('live: NetEase + QQ search, scoring, lyrics and automatic matching through real APIs', async () => {
-  /* The lyrics server's own upstream transport (allow-list, NetEase X-Real-IP, pacing). */
-  const { createTransport } = require('../server/src/upstream.js');
-  const transport = createTransport({ neteaseRealIp: '211.161.244.70' });
+  /* Direct provider access like the lyrics server's relay does it (NetEase wants a mainland X-Real-IP). */
+  const transport = async (req) => {
+    const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/126.0 Safari/537.36', Accept: 'application/json', ...(req.headers || {}) };
+    if (/163\.com/.test(req.url)) { headers['X-Real-IP'] = '211.161.244.70'; headers['X-Forwarded-For'] = '211.161.244.70'; }
+    if (req.body != null && !Object.keys(headers).some(h => h.toLowerCase() === 'content-type')) headers['Content-Type'] = 'application/json';
+    const r = await fetch(req.url, { method: req.method, headers, body: req.body == null ? undefined : String(req.body), redirect: 'manual', signal: AbortSignal.timeout(12000) });
+    return { status: r.status, body: await r.text(), retryAfter: r.headers.get('retry-after') };
+  };
   const engine = new core.Engine({ store: new MemoryStore(), http: new core.Http(transport), settings: () => ({ preferred_provider: 'qq' }) });
   const track = { uri: 'spotify:track:4iV5W9uYEdYUVa79Axb7Rh', title: '晴天', artists: ['周杰伦'], album: '叶惠美', duration_ms: 269000 };
   await engine.setTrack(track);
