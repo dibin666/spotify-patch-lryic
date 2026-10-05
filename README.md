@@ -4,15 +4,28 @@ Spotify 桌面客户端第三方歌词插件，支持 Windows / macOS / Linux。
 
 ## 界面预览
 
-| 封面取色 · 双语歌词 | 封面模糊背景 |
-| :---: | :---: |
-| [![封面取色 · 双语歌词](docs/screenshots/01-lyrics.webp)](docs/screenshots/01-lyrics.webp) | [![封面模糊背景](docs/screenshots/02-blur.webp)](docs/screenshots/02-blur.webp) |
-| **深色极简背景** | **右侧栏迷你歌词** |
-| [![深色极简背景](docs/screenshots/03-dark.webp)](docs/screenshots/03-dark.webp) | [![右侧栏迷你歌词](docs/screenshots/05-mini.webp)](docs/screenshots/05-mini.webp) |
-| **手动搜索与匹配** | **候选歌词预览与绑定** |
-| [![手动搜索与匹配](docs/screenshots/06-match.webp)](docs/screenshots/06-match.webp) | [![候选歌词预览与绑定](docs/screenshots/07-preview.webp)](docs/screenshots/07-preview.webp) |
-| **显示与歌词设置** | **时间校准与网络** |
-| [![显示与歌词设置](docs/screenshots/08-settings.webp)](docs/screenshots/08-settings.webp) | [![时间校准与网络](docs/screenshots/09-network.webp)](docs/screenshots/09-network.webp) |
+<p align="center">
+  <img src="docs/screenshots/word-sync.webp" width="820" alt="逐字高亮与双语译文">
+  <br><sub>逐字高亮 · 双语译文 · 自动跟随滚动</sub>
+</p>
+
+<p align="center">
+  <img src="docs/screenshots/backgrounds.webp" width="820" alt="三种背景：封面取色、封面模糊、深色">
+  <br><sub>三种背景：封面取色 · 封面模糊 · 深色</sub>
+</p>
+
+<table align="center">
+  <tr>
+    <td align="center" width="33%"><a href="docs/screenshots/mini.webp"><img src="docs/screenshots/mini.webp" alt="右侧栏迷你歌词"></a><br><sub>右侧栏迷你歌词</sub></td>
+    <td align="center" width="33%"><a href="docs/screenshots/match.webp"><img src="docs/screenshots/match.webp" alt="手动搜索与匹配"></a><br><sub>手动搜索与匹配</sub></td>
+    <td align="center" width="33%"><a href="docs/screenshots/preview.webp"><img src="docs/screenshots/preview.webp" alt="预览候选歌词并绑定"></a><br><sub>预览候选歌词并绑定</sub></td>
+  </tr>
+  <tr>
+    <td align="center"><a href="docs/screenshots/settings.webp"><img src="docs/screenshots/settings.webp" alt="歌词来源与显示设置"></a><br><sub>歌词来源与显示设置</sub></td>
+    <td align="center"><a href="docs/screenshots/network.webp"><img src="docs/screenshots/network.webp" alt="时间校准与网络"></a><br><sub>时间校准与网络</sub></td>
+    <td align="center"><a href="docs/screenshots/upload.webp"><img src="docs/screenshots/upload.webp" alt="上传到服务器前确认覆盖"></a><br><sub>上传前检查服务器，确认后覆盖</sub></td>
+  </tr>
+</table>
 
 ## 功能
 
@@ -22,7 +35,8 @@ Spotify 桌面客户端第三方歌词插件，支持 Windows / macOS / Linux。
 - 右侧栏迷你歌词
 - 背景：封面取色 / 封面模糊 / 深色
 - 字号、时间偏移可调
-- 可选云端服务器，多设备共享匹配
+- 提前匹配队列中接下来的两首歌，切歌即显示
+- 可选云端服务器，多设备共享：只通过播放栏的上传按钮手动上传（歌词、匹配和偏移一起），服务器已有歌词时确认后才覆盖
 
 ## 安装
 
