@@ -5,27 +5,27 @@ Spotify 桌面客户端第三方歌词插件，支持 Windows / macOS / Linux。
 ## 界面预览
 
 <p align="center">
-  <img src="docs/screenshots/word-sync.webp" width="100%" alt="逐字高亮与双语译文">
+  <img src="docs/screenshots/word-sync.171026b2.webp" width="100%" alt="逐字高亮与双语译文">
   <br><sub>逐字高亮 · 双语译文 · 自动跟随滚动（个人信息已模糊）</sub>
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/backgrounds.webp" width="100%" alt="三种背景：封面取色、封面模糊、深色">
+  <img src="docs/screenshots/backgrounds.93fdb1d0.webp" width="100%" alt="三种背景：封面取色、封面模糊、深色">
   <br><sub>三种背景：封面取色 · 封面模糊 · 深色</sub>
 </p>
 
 <table>
   <tr>
-    <td align="center" width="50%"><a href="docs/screenshots/mini.webp"><img src="docs/screenshots/mini.webp" alt="右侧栏迷你歌词（同样逐字高亮）"></a><br><sub>右侧栏迷你歌词（同样逐字高亮）</sub></td>
-    <td align="center" width="50%"><a href="docs/screenshots/match.webp"><img src="docs/screenshots/match.webp" alt="手动搜索与匹配"></a><br><sub>手动搜索与匹配</sub></td>
+    <td align="center" width="50%"><a href="docs/screenshots/mini.a96e03e6.webp"><img src="docs/screenshots/mini.a96e03e6.webp" alt="右侧栏迷你歌词（同样逐字高亮）"></a><br><sub>右侧栏迷你歌词（同样逐字高亮）</sub></td>
+    <td align="center" width="50%"><a href="docs/screenshots/match.fc1912b2.webp"><img src="docs/screenshots/match.fc1912b2.webp" alt="手动搜索与匹配"></a><br><sub>手动搜索与匹配</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><a href="docs/screenshots/preview.webp"><img src="docs/screenshots/preview.webp" alt="预览候选歌词并绑定"></a><br><sub>预览候选歌词并绑定</sub></td>
-    <td align="center" width="50%"><a href="docs/screenshots/settings.webp"><img src="docs/screenshots/settings.webp" alt="歌词来源与显示设置"></a><br><sub>歌词来源与显示设置</sub></td>
+    <td align="center" width="50%"><a href="docs/screenshots/preview.44beb8bc.webp"><img src="docs/screenshots/preview.44beb8bc.webp" alt="预览候选歌词并绑定"></a><br><sub>预览候选歌词并绑定</sub></td>
+    <td align="center" width="50%"><a href="docs/screenshots/settings.ae99a804.webp"><img src="docs/screenshots/settings.ae99a804.webp" alt="歌词来源与显示设置"></a><br><sub>歌词来源与显示设置</sub></td>
   </tr>
   <tr>
-    <td align="center" width="50%"><a href="docs/screenshots/network.webp"><img src="docs/screenshots/network.webp" alt="时间校准与网络"></a><br><sub>时间校准与网络</sub></td>
-    <td align="center" width="50%"><a href="docs/screenshots/upload.webp"><img src="docs/screenshots/upload.webp" alt="上传前检查服务器，确认后覆盖"></a><br><sub>上传前检查服务器，确认后覆盖</sub></td>
+    <td align="center" width="50%"><a href="docs/screenshots/network.9de96b2d.webp"><img src="docs/screenshots/network.9de96b2d.webp" alt="时间校准与网络"></a><br><sub>时间校准与网络</sub></td>
+    <td align="center" width="50%"><a href="docs/screenshots/upload.b1394140.webp"><img src="docs/screenshots/upload.b1394140.webp" alt="上传前检查服务器，确认后覆盖"></a><br><sub>上传前检查服务器，确认后覆盖</sub></td>
   </tr>
 </table>
 
