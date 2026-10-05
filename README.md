@@ -6,7 +6,7 @@ Spotify 桌面客户端第三方歌词插件，支持 Windows / macOS / Linux。
 
 <p align="center">
   <img src="docs/screenshots/word-sync.171026b2.webp" width="100%" alt="逐字高亮与双语译文">
-  <br><sub>逐字高亮 · 双语译文 · 自动跟随滚动（个人信息已模糊）</sub>
+  <br><sub>逐字高亮 · 双语译文 · 自动跟随滚动 </sub>
 </p>
 
 <p align="center">
