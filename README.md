@@ -5,25 +5,27 @@ Spotify 桌面客户端第三方歌词插件，支持 Windows / macOS / Linux。
 ## 界面预览
 
 <p align="center">
-  <img src="docs/screenshots/word-sync.webp" width="820" alt="逐字高亮与双语译文">
-  <br><sub>逐字高亮 · 双语译文 · 自动跟随滚动</sub>
+  <img src="docs/screenshots/word-sync.webp" width="100%" alt="逐字高亮与双语译文">
+  <br><sub>逐字高亮 · 双语译文 · 自动跟随滚动（个人信息已模糊）</sub>
 </p>
 
 <p align="center">
-  <img src="docs/screenshots/backgrounds.webp" width="820" alt="三种背景：封面取色、封面模糊、深色">
+  <img src="docs/screenshots/backgrounds.webp" width="100%" alt="三种背景：封面取色、封面模糊、深色">
   <br><sub>三种背景：封面取色 · 封面模糊 · 深色</sub>
 </p>
 
-<table align="center">
+<table>
   <tr>
-    <td align="center" width="33%"><a href="docs/screenshots/mini.webp"><img src="docs/screenshots/mini.webp" alt="右侧栏迷你歌词"></a><br><sub>右侧栏迷你歌词</sub></td>
-    <td align="center" width="33%"><a href="docs/screenshots/match.webp"><img src="docs/screenshots/match.webp" alt="手动搜索与匹配"></a><br><sub>手动搜索与匹配</sub></td>
-    <td align="center" width="33%"><a href="docs/screenshots/preview.webp"><img src="docs/screenshots/preview.webp" alt="预览候选歌词并绑定"></a><br><sub>预览候选歌词并绑定</sub></td>
+    <td align="center" width="50%"><a href="docs/screenshots/mini.webp"><img src="docs/screenshots/mini.webp" alt="右侧栏迷你歌词（同样逐字高亮）"></a><br><sub>右侧栏迷你歌词（同样逐字高亮）</sub></td>
+    <td align="center" width="50%"><a href="docs/screenshots/match.webp"><img src="docs/screenshots/match.webp" alt="手动搜索与匹配"></a><br><sub>手动搜索与匹配</sub></td>
   </tr>
   <tr>
-    <td align="center"><a href="docs/screenshots/settings.webp"><img src="docs/screenshots/settings.webp" alt="歌词来源与显示设置"></a><br><sub>歌词来源与显示设置</sub></td>
-    <td align="center"><a href="docs/screenshots/network.webp"><img src="docs/screenshots/network.webp" alt="时间校准与网络"></a><br><sub>时间校准与网络</sub></td>
-    <td align="center"><a href="docs/screenshots/upload.webp"><img src="docs/screenshots/upload.webp" alt="上传到服务器前确认覆盖"></a><br><sub>上传前检查服务器，确认后覆盖</sub></td>
+    <td align="center" width="50%"><a href="docs/screenshots/preview.webp"><img src="docs/screenshots/preview.webp" alt="预览候选歌词并绑定"></a><br><sub>预览候选歌词并绑定</sub></td>
+    <td align="center" width="50%"><a href="docs/screenshots/settings.webp"><img src="docs/screenshots/settings.webp" alt="歌词来源与显示设置"></a><br><sub>歌词来源与显示设置</sub></td>
+  </tr>
+  <tr>
+    <td align="center" width="50%"><a href="docs/screenshots/network.webp"><img src="docs/screenshots/network.webp" alt="时间校准与网络"></a><br><sub>时间校准与网络</sub></td>
+    <td align="center" width="50%"><a href="docs/screenshots/upload.webp"><img src="docs/screenshots/upload.webp" alt="上传前检查服务器，确认后覆盖"></a><br><sub>上传前检查服务器，确认后覆盖</sub></td>
   </tr>
 </table>
 
@@ -32,7 +34,7 @@ Spotify 桌面客户端第三方歌词插件，支持 Windows / macOS / Linux。
 - 歌词来源：网易云音乐、QQ 音乐，Spotify 官方歌词兜底
 - 逐字高亮、双语翻译
 - 自动匹配，也可手动搜索、绑定、导入 LRC
-- 右侧栏迷你歌词
+- 右侧栏迷你歌词（同样逐字高亮）
 - 背景：封面取色 / 封面模糊 / 深色
 - 字号、时间偏移可调
 - 提前匹配队列中接下来的两首歌，切歌即显示
