@@ -842,6 +842,45 @@
     return null;
   }
 
+  /* Word-by-word fill of the active line, shared by the lyrics page and the mini view: the
+   * line's words become spans whose gradient position (--p) follows playback; the
+   * translation follows the same progress, spread over the whole line. */
+  class WordFill {
+    constructor() { this.reset(); }
+    reset() { this.line = -1; this.lines = null; this.els = null; this.spans = null; this.trans = null; }
+    wrap(lines, els, index) {
+      const line = lines[index], el = els[index];
+      if (!line || !el || !line.words || !line.words.length) return false;
+      const text = el.querySelector('.sl-text');
+      text.replaceChildren(...line.words.map(w => h('span', { class: 'sl-w' }, w.text)));
+      this.spans = text.children; this.line = index; this.lines = lines; this.els = els; this.trans = null;
+      const trans = el.querySelector('.sl-trans');
+      if (trans && line.translated_text) { const span = h('span', { class: 'sl-w' }, line.translated_text); trans.replaceChildren(span); this.trans = span; }
+      return true;
+    }
+    unwrap() {
+      const el = this.els && this.els[this.line], line = this.lines && this.lines[this.line];
+      if (el && line) {
+        el.querySelector('.sl-text').textContent = line.text;
+        const trans = el.querySelector('.sl-trans');
+        if (trans && line.translated_text) trans.textContent = line.translated_text;
+      }
+      this.reset();
+    }
+    update(lines, els, index, position) {
+      if ((this.line !== index || this.els !== els) && !this.wrap(lines, els, index)) return;
+      const words = lines[index].words;
+      const set = (span, p) => {
+        const value = p >= 1 ? '1' : p <= 0 ? '0' : p.toFixed(3);
+        /* 0..1 maps to 0..106% so the 6% soft edge never leaks before or lingers after a word. */
+        if (span._p !== value) { span._p = value; span.style.setProperty('--p', `${(+value * 106).toFixed(1)}%`); }
+      };
+      const progress = (start, end) => end > start ? clamp((position - start) / (end - start), 0, 1) : position >= start ? 1 : 0;
+      for (let i = 0; i < words.length; i++) set(this.spans[i], progress(words[i].start_time_ms, words[i].end_time_ms));
+      if (this.trans) set(this.trans, progress(words[0].start_time_ms, words[words.length - 1].end_time_ms));
+    }
+  }
+
   /* ------------------------------------------ right sidebar mini lyrics - */
   /* A scaled-down lyrics view inside Spotify's "Now playing" sidebar, right below the cover,
    * title and artist, filling the rest of the visible sidebar (the cards below - related
@@ -851,6 +890,7 @@
     constructor(app) {
       this.app = app;
       this.lyricsRef = null; this.lines = []; this.els = []; this.active = -2; this.shown = null; this.timer = 0; this.pending = 0;
+      this.fill = new WordFill(); this.words = false;
       this.closeBtn = h('button', {
         type: 'button', class: 'sl-mini-close', 'aria-label': '关闭迷你歌词', title: '关闭迷你歌词（可在歌词设置中重新开启）',
         onclick: () => { app.store.set('mini_player', false); this.refresh(); if (app.view.panel) app.view.panel.renderBody(); },
@@ -926,13 +966,21 @@
       else if (this.scroller.scrollTop !== top) this.scroller.scrollTop = top;
     }
     refresh() {
-      if (!this.enabled()) { this.el.remove(); this.sizer.disconnect(); clearInterval(this.timer); this.timer = 0; return; }
+      if (!this.enabled()) { this.el.remove(); this.sizer.disconnect(); clearTimeout(this.timer); this.timer = 0; return; }
       const app = this.app;
       if (app.pendingTrack !== undefined) { app.engine.setTrack(app.pendingTrack); app.pendingTrack = undefined; }
-      if (!this.timer) this.timer = setInterval(() => { if (document.visibilityState === 'visible' && this.el.isConnected) this.update(false); }, 300);
+      if (!this.timer) this.schedule();
       this.attach();
       this.lyricsRef = null;
       this.render();
+    }
+    /* ~30 fps while word-synced lyrics play on screen (the word fill), otherwise every 300 ms. */
+    schedule() {
+      clearTimeout(this.timer); this.timer = 0;
+      if (!this.enabled()) return;
+      const visible = document.visibilityState === 'visible' && this.el.isConnected;
+      const fast = visible && this.words && this.app.playing();
+      this.timer = setTimeout(() => { if (visible) this.update(false); this.schedule(); }, fast ? 33 : 300);
     }
     trackChanged() { this.lyricsRef = null; this.render(); }
     render() {
@@ -944,15 +992,17 @@
       setHidden(this.empty, usable);
       setHidden(this.scroller, !usable);
       if (!usable) {
-        this.lyricsRef = null; this.lines = []; this.els = [];
+        this.lyricsRef = null; this.lines = []; this.els = []; this.words = false; this.fill.reset();
         this.empty.textContent = !app.currentTrack ? '没有正在播放的歌曲' : engine.busy ? '正在加载歌词…' : engine.status === '纯音乐，没有歌词' ? '纯音乐，没有歌词' : '暂无歌词';
         return;
       }
-      const showTranslation = !!app.store.setting('translation');
-      if (this.lyricsRef === lyrics && this.shown === showTranslation) { this.update(false); return; }
-      this.lyricsRef = lyrics; this.shown = showTranslation;
+      const showTranslation = !!app.store.setting('translation'), wordSync = app.store.setting('word_sync') !== false;
+      if (this.lyricsRef === lyrics && this.shown === showTranslation && this.wordSync === wordSync) { this.update(false); return; }
+      this.lyricsRef = lyrics; this.shown = showTranslation; this.wordSync = wordSync;
       this.lines = lyrics.lines;
       this.synced = lyrics.sync_type !== 'unsynced';
+      this.words = this.synced && lyrics.sync_type === 'word' && wordSync;
+      this.fill.reset();
       this.seekable = this.synced && app.canSeek();
       this.linesBox.classList.toggle('sl-seekable', this.seekable);
       this.linesBox.classList.toggle('sl-static', !this.synced);
@@ -966,9 +1016,14 @@
     }
     update(initial) {
       if (!this.synced || !this.els.length || !this.el.isConnected || this.scroller.hidden) return;
-      const index = Core.lyricsIndex(this.app.engine.lyrics, this.app.position() + this.app.engine.offset());
-      if (index === this.active && !initial) return;
+      const position = this.app.position() + this.app.engine.offset();
+      const index = Core.lyricsIndex(this.app.engine.lyrics, position);
+      if (index !== this.active || initial) this.moveTo(index, initial);
+      if (this.words && index >= 0) this.fill.update(this.lines, this.els, index, position);
+    }
+    moveTo(index, initial) {
       const previous = this.active;
+      if (this.fill.line >= 0 && this.fill.line !== index) this.fill.unwrap();
       this.active = index;
       /* Only the lines whose state changed are touched. */
       const lo = initial || previous < -1 ? 0 : Math.max(0, Math.min(previous, index));
@@ -985,7 +1040,7 @@
   class LyricsView {
     constructor(app) {
       this.app = app;
-      this.lines = []; this.els = []; this.active = -2; this.wordLine = -1; this.timer = 0; this.frame = 0;
+      this.lines = []; this.els = []; this.active = -2; this.fill = new WordFill(); this.timer = 0; this.frame = 0;
       this.userScrolling = false; this.scrollEndTimer = 0; this.lyricsRef = null; this.panel = null;
       this.build();
     }
@@ -1149,7 +1204,7 @@
       const source = NAMES[lyrics.source] || lyrics.source;
       const provider = lyrics.source === 'spotify' ? (lyrics.provider_name || lyrics.provider || 'Spotify') : source;
       this.footer.textContent = `歌词提供者：${provider}`;
-      this.active = -2; this.wordLine = -1;
+      this.active = -2; this.fill.reset();
       this.visibility.disconnect();
       this.update(true);
       if (scrollToActive) {
@@ -1209,54 +1264,13 @@
             el.classList.toggle('sl-past', i < index); el.classList.toggle('sl-active', i === index); el.classList.toggle('sl-future', i > index);
           }
         }
-        if (this.wordLine >= 0 && this.wordLine !== index) this.unwrapWords(this.wordLine);
+        if (this.fill.line >= 0 && this.fill.line !== index) this.fill.unwrap();
         this.active = index;
         this.visibility.disconnect();
         if (index >= 0) this.visibility.observe(this.els[index]); else { this.offscreen = false; this.syncBtn.classList.remove('sl-visible'); }
         if (!initial) this.autoScroll(previous, index);
       }
-      if (this.words && index >= 0) this.updateWords(index, position);
-    }
-    wrapWords(index) {
-      const line = this.lines[index], el = this.els[index];
-      if (!line.words || !line.words.length) return false;
-      const text = el.querySelector('.sl-text');
-      text.replaceChildren(...line.words.map(w => h('span', { class: 'sl-w' }, w.text)));
-      this.wordEls = text.children; this.wordLine = index;
-      /* The translation follows the same progress, spread over the whole line. */
-      const trans = el.querySelector('.sl-trans');
-      this.transEl = null;
-      if (trans && line.translated_text) {
-        const span = h('span', { class: 'sl-w' }, line.translated_text);
-        trans.replaceChildren(span); this.transEl = span;
-      }
-      return true;
-    }
-    unwrapWords(index) {
-      const el = this.els[index], line = this.lines[index];
-      if (el && line) {
-        el.querySelector('.sl-text').textContent = line.text;
-        const trans = el.querySelector('.sl-trans');
-        if (trans && line.translated_text) trans.textContent = line.translated_text;
-      }
-      this.wordLine = -1; this.wordEls = null; this.transEl = null;
-    }
-    updateWords(index, position) {
-      if (this.wordLine !== index && !this.wrapWords(index)) return;
-      const words = this.lines[index].words;
-      for (let i = 0; i < words.length; i++) {
-        const w = words[i], span = this.wordEls[i];
-        const p = w.end_time_ms > w.start_time_ms ? clamp((position - w.start_time_ms) / (w.end_time_ms - w.start_time_ms), 0, 1) : position >= w.start_time_ms ? 1 : 0;
-        const value = p >= 1 ? '1' : p <= 0 ? '0' : p.toFixed(3);
-        /* 0..1 maps to 0..106% so the 6% soft edge never leaks before or lingers after a word. */
-        if (span._p !== value) { span._p = value; span.style.setProperty('--p', `${(+value * 106).toFixed(1)}%`); }
-      }
-      if (this.transEl) {
-        const first = words[0].start_time_ms, last = words[words.length - 1].end_time_ms;
-        const p = last > first ? clamp((position - first) / (last - first), 0, 1) : position >= first ? 1 : 0;
-        const value = p >= 1 ? '1' : p <= 0 ? '0' : p.toFixed(3);
-        if (this.transEl._p !== value) { this.transEl._p = value; this.transEl.style.setProperty('--p', `${(+value * 106).toFixed(1)}%`); }
-      }
+      if (this.words && index >= 0) this.fill.update(this.lines, this.els, index, position);
     }
     /* Spotify's auto-scroll zone: follow only while the reader is "with" the song. */
     autoScroll(previous, index) {
