@@ -749,6 +749,11 @@
   const CANCELLED = Symbol('cancelled');
   /* Shared bindings fetched from the lyrics server are cached locally for a while. */
   const CLOUD_CACHE = 'cloud1:', CLOUD_TTL = 1800, CLOUD_MISS_TTL = 600;
+  /* Per-track offset ("偏移"): stored here, uploaded with the lyrics by the upload button. */
+  const OFFSET_KEY = 'offset:', MAX_OFFSET = 5000;
+  const clampOffset = v => Math.max(-MAX_OFFSET, Math.min(MAX_OFFSET, Math.round(Number(v) || 0)));
+  /* Background matching (upcoming tracks) fills the caches without touching the screen. */
+  const SILENT = { install() {}, status() {} };
   const trackPayload = t => ({ uri: t.uri || '', title: t.title || '', artists: (t.artists || []).slice(0, 20), album: t.album || '', duration_ms: t.duration_ms || 0 });
 
   /* Runs entirely on the client: NetEase / QQ requests go through deps.http (direct, or
@@ -767,6 +772,11 @@
        * and how it was chosen: local | cloud | manual | auto | verified | spotify. */
       this.match = null; this.origin = null; this.cloudError = '';
       this.generation = 0; this.controller = null; this.busy = false;
+      this.ui = { install: (...args) => this._install(...args), status: text => this._setStatus(text) };
+      /* Upcoming tracks: key -> running background match / time it finished. */
+      this.prefetching = new Map(); this.prefetched = new Map(); this.upcoming = []; this.prefetchActive = false;
+      /* The lyrics server's copy for the playing track: undefined unknown, null none, or the binding. */
+      this.remote = undefined;
     }
     _changed() { try { this.deps.onChange && this.deps.onChange(); } catch (e) { console.error('[spot-lyric]', e); } }
     _setStatus(text) { this.status = text; this._changed(); }
@@ -783,19 +793,44 @@
     }
     offset() {
       if (!this.track) return 0;
-      return (this.store.getInt('timing-offset-ms', 0)) + this.store.getInt('offset:' + trackKey(this.track), 0);
+      return (this.store.getInt('timing-offset-ms', 0)) + this.trackOffset(this.track);
     }
+    /* The offset of one track (without the global one). Set on this machine it wins; otherwise
+     * lyrics loaded from the server bring the offset that was uploaded with them. */
+    trackOffset(track) {
+      if (!track) return 0;
+      const own = this.store.get(OFFSET_KEY + trackKey(track), null);
+      if (own != null && own !== '') return clampOffset(parseInt(own, 10));
+      const remote = this.remote;
+      return this.origin === 'cloud' && remote && typeof remote.offset_ms === 'number' && trackEqual(track, this.track) ? clampOffset(remote.offset_ms) : 0;
+    }
+    /* Only stored here: the upload button saves it on the lyrics server with the lyrics. */
     setOffset(value, global) {
       if (!global && !this.track) return;
-      const key = global ? 'timing-offset-ms' : 'offset:' + trackKey(this.track);
-      this.store.set(key, String(Math.max(-5000, Math.min(5000, Math.round(value)))));
+      const key = global ? 'timing-offset-ms' : OFFSET_KEY + trackKey(this.track);
+      this.store.set(key, String(clampOffset(value)));
       this._changed();
+    }
+    /** How the lyrics on screen compare with the copy on the lyrics server:
+     * undefined unknown (not checked / unreachable), 'none' nothing stored, 'same', or what differs: 'lyrics' | 'offset'. */
+    remoteState() {
+      const doc = this.remote, lyrics = this.lyrics;
+      if (doc === undefined || !this.track) return undefined;
+      if (!doc) return 'none';
+      if (!lyricsUsable(lyrics)) return 'lyrics';
+      const match = this.match, lines = (doc.lyrics && doc.lyrics.lines) || [];
+      const sameSource = doc.match && match ? doc.match.provider === match.provider && String(doc.match.id) === String(match.id)
+        : !doc.match && !match && (doc.source || (doc.lyrics && doc.lyrics.source)) === lyrics.source;
+      const sameLines = lines.length === lyrics.lines.length && lines.every((l, i) => l.text === lyrics.lines[i].text && l.start_time_ms === lyrics.lines[i].start_time_ms);
+      if (!sameSource || !sameLines) return 'lyrics';
+      return (typeof doc.offset_ms === 'number' ? clampOffset(doc.offset_ms) : 0) === this.trackOffset(this.track) ? 'same' : 'offset';
     }
     _interrupt() { if (this.controller) this.controller.abort(); this.generation++; this.busy = false; }
     async importLyrics(lyrics) {
       if (!lyricsUsable(lyrics) || !this.track) return;
       this._interrupt();
       await this.store.kvSet('local-lyrics:' + trackKey(this.track), JSON.stringify(lyrics));
+      this.prefetched.delete(trackKey(this.track));
       this._install(lyrics, null, null, 'local'); this._setStatus('已绑定本地歌词');
     }
 
@@ -865,34 +900,70 @@
       const generation = ++this.generation;
       this.track = track ? JSON.parse(JSON.stringify(track)) : null;
       this._install(null);
+      this.remote = this.cloud && track && spotifyId(track.uri) ? undefined : null;
       if (!track || !track.title) { this._setStatus('等待播放器'); return; }
       const controller = this.controller = new AbortController();
       const current = () => generation === this.generation && !controller.signal.aborted;
       this.busy = true;
-      try { await this._match(track, force, controller.signal, current); }
+      if (force) this.prefetched.delete(trackKey(track));
+      try { await this._match(track, force, controller.signal, current, this.ui); }
       catch (e) { if (e !== CANCELLED && current()) { console.error('[spot-lyric]', e); this._setStatus('匹配出错：' + (e.message || e)); } }
       finally { if (current()) { this.busy = false; this._changed(); } }
     }
-    async _match(track, force, signal, current) {
+    /* Upcoming tracks (the next ones in the queue) are matched in the background, one at a
+     * time, through the same caches: when one starts playing its lyrics are already there. */
+    prefetch(tracks) {
+      this.upcoming = (tracks || []).filter(t => t && t.title).slice(0, 2).map(t => JSON.parse(JSON.stringify(t)));
+      if (!this.prefetchActive) this._prefetchNext();
+    }
+    async _prefetchNext() {
+      this.prefetchActive = true;
+      try {
+        for (let track; (track = this.upcoming.shift());) {
+          const key = trackKey(track);
+          if (trackEqual(this.track, track) || this.prefetching.has(key) || Date.now() - (this.prefetched.get(key) || 0) < 600000) continue;
+          const signal = new AbortController().signal;
+          const done = this._match(track, false, signal, () => true, SILENT)
+            .catch(e => { if (e !== CANCELLED) console.warn('[spot-lyric] prefetch', e); });
+          this.prefetching.set(key, done);
+          await done;
+          this.prefetching.delete(key);
+          this.prefetched.set(key, Date.now());
+          if (this.prefetched.size > 50) this.prefetched.delete(this.prefetched.keys().next().value);
+        }
+      } finally { this.prefetchActive = false; }
+    }
+    async _match(track, force, signal, current, ui = this.ui) {
       const check = () => { if (!current()) throw CANCELLED; };
       const key = trackKey(track);
+      /* Already being matched in the background: wait for it and use its result. */
+      const pending = !force && ui !== SILENT && this.prefetching.get(key);
+      if (pending) { ui.status('正在匹配歌词'); await pending; check(); }
+      const visible = ui !== SILENT;
       const local = await this.store.kvGet('local-lyrics:' + key); check();
       if (local && !force) {
         const lyrics = JSON.parse(local);
-        if (lyricsUsable(lyrics)) { this._install(lyrics, null, null, 'local'); this.http.cacheHit(); this._setStatus('本地歌词'); return; }
-      }
-      /* Lyrics chosen or uploaded by a user and shared through the lyrics server
-       * ("重新自动匹配" deliberately skips them). */
-      if (!force && this.cloud && spotifyId(track.uri)) {
-        const doc = await this._cloudGet(track, signal); check();
-        if (doc) {
-          const lyrics = await this._cloudLyrics(track, doc, signal); check();
-          const name = PROVIDER_NAMES[(doc.match && doc.match.provider) || doc.source] || '';
-          this._install(lyrics, null, candidateFromJson(doc.match), 'cloud');
-          this._setStatus(`云端歌词${name ? ' · ' + name : ''}`); return;
+        if (lyricsUsable(lyrics)) {
+          ui.install(lyrics, null, null, 'local'); this.http.cacheHit(); ui.status('本地歌词');
+          if (visible) this._learnRemote(track, signal, current);
+          return;
         }
       }
       let { candidate: saved, manual } = await this.store.matchGet(track); check();
+      /* Lyrics uploaded to the lyrics server (by anyone) come before automatic matching; a
+       * binding chosen on this machine comes first ("重新自动匹配" skips both). */
+      let remoteKnown = false;
+      if (!force && !manual && this.cloud && spotifyId(track.uri)) {
+        const doc = await this._cloudGet(track, signal); check();
+        if (visible) { this.remote = doc; remoteKnown = true; }
+        if (doc) {
+          const lyrics = await this._cloudLyrics(track, doc, signal); check();
+          const name = PROVIDER_NAMES[(doc.match && doc.match.provider) || doc.source] || '';
+          ui.install(lyrics, null, candidateFromJson(doc.match), 'cloud');
+          ui.status(`云端歌词${name ? ' · ' + name : ''}`); return;
+        }
+      }
+      if (visible && !remoteKnown) this._learnRemote(track, signal, current);
       if (saved && !manual) { const verified = saved.verified; matchScore(track, saved); if (!saved.eligible && !verified) saved = null; }
       const lyricsKey = TRACK_CACHE + key, negativeKey = NEGATIVE + key;
       if (!force) {
@@ -900,13 +971,13 @@
         if (cached) {
           const entry = JSON.parse(cached);
           if (lyricsUsable(entry.lyrics) && (saved || entry.lyrics.source === 'spotify')) {
-            this._install(entry.lyrics, entry.colors, entry.match && candidateFromJson(entry.match), entry.origin || (manual ? 'manual' : 'auto'));
+            ui.install(entry.lyrics, entry.colors, entry.match && candidateFromJson(entry.match), entry.origin || (manual ? 'manual' : 'auto'));
             this.http.cacheHit();
-            this._setStatus(manual ? '已绑定歌词 · 缓存' : '歌词缓存'); return;
+            ui.status(manual ? '已绑定歌词 · 缓存' : '歌词缓存'); return;
           }
         }
         const negative = await this.store.cacheGet(negativeKey); check();
-        if (negative) { this.http.cacheHit(); this._setStatus(negative); return; }
+        if (negative) { this.http.cacheHit(); ui.status(negative); return; }
       } else {
         await this.store.cacheRemove(lyricsKey); await this.store.cacheRemove(negativeKey);
         if (saved) await this.store.cacheRemove(`${LYRICS_CACHE}:${saved.provider}:${saved.id}`);
@@ -914,9 +985,9 @@
       }
       const job = {
         track, key, preferred: this._preferred(), candidates: [], fetched: new Set(), failed: false,
-        searches: { remaining: 6 }, lyricsBudget: { remaining: 3 }, signal, check,
+        searches: { remaining: 6 }, lyricsBudget: { remaining: 3 }, signal, check, ui,
       };
-      this._setStatus('正在匹配歌词');
+      ui.status('正在匹配歌词');
       const settings = this.deps.settings();
       if (settings.spotify_first && !saved) {
         const result = await this._spotify(job);
@@ -1015,16 +1086,17 @@
     }
     async _complete(job, lyrics, status, colors, match, origin) {
       job.check(); job.done = true;
-      this._install(lyrics, colors, match, origin);
+      job.ui.install(lyrics, colors, match, origin);
       if (lyricsUsable(lyrics)) {
         const entry = { lyrics, colors: colors || null, match: match ? candidateJson(match) : null, origin: origin || null };
         await this.store.cachePut(TRACK_CACHE + job.key, JSON.stringify(entry), 0);
         await this.store.cacheRemove(NEGATIVE + job.key);
-      } else {
+      } else if (!(job.failed && job.ui === SILENT)) {
+        /* A failed background attempt is not remembered: the track is tried again when it plays. */
         await this.store.cachePut(NEGATIVE + job.key, status, job.failed ? 60 : 21600);
       }
       job.check();
-      this._setStatus(status);
+      job.ui.status(status);
     }
 
     /* -------------------------------------------------- lyrics server ---- */
@@ -1038,45 +1110,67 @@
       }
       let doc = null;
       try { doc = await this.cloud.get(id, signal); this.cloudError = ''; }
-      catch (e) { if (e.kind === 'cancelled' || (signal && signal.aborted)) throw CANCELLED; this.cloudError = e.message || String(e); return null; }
+      catch (e) { if (e.kind === 'cancelled' || (signal && signal.aborted)) throw CANCELLED; this.cloudError = e.message || String(e); return undefined; }
       const usable = !!(doc && lyricsUsable(doc.lyrics));
       await this.store.cachePut(key, JSON.stringify(usable ? doc : null), usable ? CLOUD_TTL : CLOUD_MISS_TTL);
       return usable ? doc : null;
     }
-    /* Lyrics stored by an older parser (e.g. misplaced translations) are re-fetched
-     * from the bound source on this machine and the server copy is refreshed. */
+    /* Lyrics stored by an older parser (e.g. misplaced translations) are re-fetched from the
+     * bound source on this machine (the server copy changes only through the upload button). */
     async _cloudLyrics(track, doc, signal) {
       const match = candidateFromJson(doc.match);
       if (!match || doc.lyrics.parser === PARSER_VERSION) return doc.lyrics;
       try {
         const fresh = await this.providerFetch(match, signal, { remaining: 2 });
-        if (!lyricsUsable(fresh)) return doc.lyrics;
-        this._upload(track, match, fresh).catch(() => {});
-        return fresh;
+        return lyricsUsable(fresh) ? fresh : doc.lyrics;
       } catch (e) { if (e.kind === 'cancelled') throw CANCELLED; return doc.lyrics; }
     }
-    /** local: not a Spotify track; offline: pure local mode (no lyrics server).
-     * @returns {Promise<{stored?: string, updated_at?: string, local?: boolean, offline?: boolean, error?: string}>} */
+    /** Uploads lyrics, the provider song they came from and the track's offset.
+     * local: not a Spotify track; offline: pure local mode (no lyrics server).
+     * @returns {Promise<{stored?: string, updated_at?: string, binding?: object, local?: boolean, offline?: boolean, error?: string}>} */
     async _upload(track, candidate, lyrics) {
       const id = spotifyId(track.uri);
       if (!id) return { local: true };
       if (!this.cloud) return { offline: true };
       try {
-        const answer = await this.cloud.put(trackPayload(track), candidate, lyrics);
+        const answer = await this.cloud.put(trackPayload(track), candidate, lyrics, this.trackOffset(track));
         await this.store.cachePut(CLOUD_CACHE + id, JSON.stringify(answer.binding || null), CLOUD_TTL);
-        return { stored: answer.stored || 'server', updated_at: answer.updated_at || '' };
+        return { stored: answer.stored || 'server', updated_at: answer.updated_at || '', binding: answer.binding || null };
       } catch (e) { return { error: e.message || String(e) }; }
     }
-    /* Uploads the lyrics on screen (with the provider song they came from, if any). */
+    /* The server copy of the playing track, learnt in the background when the lyrics on
+     * screen did not come from it (for the upload button's state). */
+    _learnRemote(track, signal, current) {
+      if (!this.cloud || !spotifyId(track.uri)) { this.remote = null; return; }
+      this._cloudGet(track, signal).then(doc => { if (current()) { this.remote = doc; this._changed(); } }, () => {});
+    }
+    /* What the lyrics server holds for the playing track right now (not the local copy):
+     * null when nothing is stored. Throws when the server cannot be reached. */
+    async remoteBinding() {
+      const track = this.track, id = spotifyId(track && track.uri);
+      if (!id || !this.cloud) return null;
+      const doc = await this.cloud.get(id);
+      const usable = !!(doc && lyricsUsable(doc.lyrics));
+      await this.store.cachePut(CLOUD_CACHE + id, JSON.stringify(usable ? doc : null), usable ? CLOUD_TTL : CLOUD_MISS_TTL);
+      if (this.track === track) { this.remote = usable ? doc : null; this._changed(); }
+      return usable ? doc : null;
+    }
+    /* The upload button: the lyrics on screen, the provider song they came from (if any) and
+     * the track's offset, all together. Nothing else ever writes to the lyrics server. */
     async upload() {
       const track = this.track, lyrics = this.lyrics;
       if (!track || !lyricsUsable(lyrics)) throw new ProviderError('当前没有可上传的歌词', 'failed');
       if (lyrics.source === 'spotify') throw new ProviderError('Spotify 官方歌词受版权保护，不上传到服务器', 'denied');
       if (!spotifyId(track.uri)) throw new ProviderError('本地文件没有 Spotify 曲目 ID，无法上传', 'denied');
       if (!this.cloud) throw new ProviderError('纯本地模式不连接歌词服务器', 'denied');
+      /* The offset on screen is uploaded: keep it on this machine too (it may come from the old copy). */
+      const offset = this.trackOffset(track);
       const result = await this._upload(track, this.match, lyrics);
       if (result.error) throw new ProviderError(result.error, 'failed');
-      if (this.track === track) { this.origin = 'cloud'; this._changed(); }
+      if (this.track === track) {
+        this.store.set(OFFSET_KEY + trackKey(track), String(offset));
+        this.remote = result.binding || null; this.origin = 'cloud'; this._changed();
+      }
       return result;
     }
 
@@ -1111,32 +1205,34 @@
       return { candidates: all, providers: groups };
     }
     preview(candidate) { return this.providerFetch(candidate, null, { remaining: 2 }); }
-    /* "使用此歌词": bound on this machine and shared through the lyrics server. */
+    /* "使用此歌词": bound on this machine only (the upload button shares it). */
     async bind(candidate, lyrics) {
-      if (!lyricsUsable(lyrics) || !this.track) return null;
+      if (!lyricsUsable(lyrics) || !this.track) return false;
       this._interrupt();
       const track = this.track, key = trackKey(track);
+      this.prefetched.delete(key);
       await this.store.matchSave(track, candidate, true);
       await this.store.kvSet('local-lyrics:' + key, '');
       await this.store.cacheRemove(NEGATIVE + key);
       await this.store.cachePut(TRACK_CACHE + key, JSON.stringify({ lyrics, colors: null, match: candidateJson(candidate), origin: 'manual' }), 0);
       this._install(lyrics, null, candidate, 'manual'); this._setStatus(`已绑定歌词 · ${PROVIDER_NAMES[candidate.provider]}`);
-      const result = await this._upload(track, candidate, lyrics);
-      if (result.stored && this.track === track) { this.origin = 'cloud'; this._changed(); }
-      return result;
+      return true;
     }
-    /* Drops the binding here and on the lyrics server, local lyrics and caches, then rematches. */
-    async unbind() {
+    /* Drops the binding and local lyrics on this machine, then matches again (the server copy,
+     * if any, applies again). remote: also delete the copy on the lyrics server. */
+    async unbind({ remote = false } = {}) {
       if (!this.track) return;
       const track = this.track, id = spotifyId(track.uri);
       let error = null;
+      this.prefetched.delete(trackKey(track));
       await this.store.matchRemove(track);
       await this.store.kvSet('local-lyrics:' + trackKey(track), '');
-      if (this.cloud && id) {
+      if (remote && this.cloud && id) {
         try { await this.cloud.remove(trackPayload(track)); } catch (e) { error = e; }
         await this.store.cacheRemove(CLOUD_CACHE + id);
       }
-      await this.setTrack(track, true);
+      this.track = null;
+      await this.setTrack(track);
       if (error) throw error;
     }
   }
@@ -1167,15 +1263,19 @@
       try { data = JSON.parse(response.body); } catch (_) { /* below */ }
       if (response.status !== 200 || !data || typeof data !== 'object') {
         const message = data && data.error ? data.error : `歌词服务器错误 ${response.status}`;
-        throw new ProviderError(message, response.status === 429 ? 'blocked' : response.status >= 500 || !response.status ? 'network' : 'failed');
+        const error = new ProviderError(message, response.status === 429 ? 'blocked' : response.status >= 500 || !response.status ? 'network' : 'failed');
+        error.status = response.status;
+        throw error;
       }
       return data;
     }
     async get(id, signal) { const answer = await this.call('GET', `/api/bindings/${encodeURIComponent(id)}`, null, signal, true); return answer ? answer.binding || null : null; }
-    put(track, candidate, lyrics) {
+    put(track, candidate, lyrics, offset) {
       const clean = sanitizeLyrics(lyrics);
       if (!clean) return Promise.reject(new ProviderError('歌词为空', 'failed'));
-      return this.call('POST', '/api/bind', { track, candidate: candidate ? candidateJson(candidate) : null, lyrics: clean });
+      const payload = { track, candidate: candidate ? candidateJson(candidate) : null, lyrics: clean };
+      if (offset != null) payload.offset_ms = clampOffset(offset);
+      return this.call('POST', '/api/bind', payload);
     }
     remove(track) { return this.call('POST', '/api/unbind', { track }); }
     /* Same contract as an Http transport: resolves {status, body, retryAfter}. */

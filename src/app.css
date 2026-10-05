@@ -29,13 +29,36 @@
 .sl-upload[data-state="busy"] { cursor: progress; animation: sl-pulse 1s infinite ease-in-out; }
 @keyframes sl-pulse { 0%, 100% { opacity: .35; } 50% { opacity: 1; } }
 .sl-tooltip {
-  position: fixed; z-index: 9999; pointer-events: none; max-width: 240px; padding: 4px 8px; border-radius: 4px;
-  background: #282828; color: #fff; font: 400 14px/20px var(--encore-body-font-stack, sans-serif);
-  box-shadow: 0 16px 24px rgba(0, 0, 0, .3), 0 6px 8px rgba(0, 0, 0, .2); white-space: nowrap;
+  position: fixed; z-index: 9999; pointer-events: none; box-sizing: border-box; width: max-content; max-width: 320px;
+  padding: 4px 8px; border-radius: 4px; background: #282828; color: #fff; font: 400 14px/20px var(--encore-body-font-stack, sans-serif);
+  box-shadow: 0 16px 24px rgba(0, 0, 0, .3), 0 6px 8px rgba(0, 0, 0, .2); white-space: normal; overflow-wrap: anywhere;
 }
+
+/* ---------- confirmation dialog ---------- */
+.sl-dialog-backdrop {
+  position: fixed; inset: 0; z-index: 10001; display: flex; align-items: center; justify-content: center;
+  background: rgba(0, 0, 0, .7); animation: sl-fade .15s ease-out;
+}
+.sl-dialog {
+  box-sizing: border-box; width: min(440px, calc(100vw - 48px)); padding: 24px; border-radius: 8px; background: #282828; color: #fff;
+  font: 400 .875rem/1.5 var(--encore-body-font-stack, sans-serif); box-shadow: 0 16px 24px rgba(0, 0, 0, .3), 0 6px 8px rgba(0, 0, 0, .2);
+  animation: sl-pop .15s ease-out;
+}
+.sl-dialog-title { margin: 0 0 12px; font-size: 1.25rem; font-weight: 700; line-height: 1.3; }
+.sl-dialog-text { margin: 0 0 8px; color: #b3b3b3; }
+.sl-dialog-text:first-of-type { color: #fff; }
+.sl-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 24px; }
+.sl-dialog-actions .sl-btn { min-height: 40px; padding: 8px 24px; }
+.sl-dialog .sl-btn:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+@keyframes sl-fade { from { opacity: 0; } }
+@keyframes sl-pop { from { opacity: 0; transform: scale(.96); } }
 
 /* ---------- page ---------- */
 #main-view.sl-host { isolation: isolate; }
+/* The Spotify page under the open lyrics page is fully covered: skip its layout and paint.
+ * Spotify re-lays it out every second (progress time) and on hover, ~50 ms each time.
+ * content-visibility keeps its state (scroll position, React tree). */
+#main-view.sl-host > :not(.sl-page) { content-visibility: hidden; }
 .sl-page {
   --lyrics-color-background: rgb(83, 83, 83);
   --lyrics-color-inactive: rgb(0, 0, 0);
@@ -43,14 +66,14 @@
   --sl-scale: 1;
   position: absolute; inset: 0; z-index: 30; overflow: hidden; outline: none;
   border-radius: inherit; color: var(--lyrics-color-active);
+  /* A layout / paint boundary: changes inside never invalidate Spotify's layout around it. */
+  contain: strict;
 }
 .sl-bg { position: absolute; inset: 0; overflow: hidden; background-color: var(--lyrics-color-background); transition: background-color .4s ease-out; }
-/* "封面模糊": the cover art, heavily blurred and dimmed, behind the lyrics. */
+/* "封面模糊": the cover art, blurred and dimmed once into a small image by the script (no CSS
+ * filter: a full-page blur was re-rendered whenever anything above it changed). */
 .sl-bg::before, .sl-bg::after { content: ""; position: absolute; pointer-events: none; opacity: 0; transition: opacity .4s ease-out; }
-.sl-bg::before {
-  inset: -20%; background: var(--sl-cover, none) center / cover no-repeat;
-  filter: blur(72px) saturate(1.15) brightness(.62); transform: translateZ(0);
-}
+.sl-bg::before { inset: 0; background: var(--sl-cover, none) center / cover no-repeat; }
 .sl-bg::after { inset: 0; background: linear-gradient(180deg, rgba(0, 0, 0, .18), rgba(0, 0, 0, .42)); }
 .sl-page[data-bg="blur"] .sl-bg::before, .sl-page[data-bg="blur"] .sl-bg::after,
 .sl-mini[data-bg="blur"] .sl-bg::before, .sl-mini[data-bg="blur"] .sl-bg::after { opacity: 1; }
@@ -91,9 +114,11 @@
 .sl-text { display: block; }
 .sl-trans { display: block; opacity: .7; font-size: .6em; font-weight: 400; }
 .sl-line.sl-active { color: var(--lyrics-color-active); }
-.sl-line.sl-past { color: var(--lyrics-color-inactive); opacity: .5; }
-.sl-seekable .sl-line.sl-past, .sl-seekable .sl-line.sl-future { cursor: pointer; transition: color .1s ease-out, opacity .1s ease-out; }
-.sl-seekable .sl-line.sl-past:hover, .sl-seekable .sl-line.sl-future:hover { color: var(--lyrics-color-active); opacity: 1; text-decoration: none; }
+.sl-line.sl-past { color: color-mix(in srgb, var(--lyrics-color-inactive) 50%, transparent); }
+/* No transition: a fading hover repainted the large line text on every frame (measured: most of
+ * the GPU and main-thread time while the mouse moves over the lyrics). */
+.sl-seekable .sl-line.sl-past, .sl-seekable .sl-line.sl-future { cursor: pointer; }
+.sl-seekable .sl-line.sl-past:hover, .sl-seekable .sl-line.sl-future:hover { color: var(--lyrics-color-active); text-decoration: none; }
 .sl-static .sl-line { color: var(--lyrics-color-active); pointer-events: none; }
 
 /* word-by-word fill on the active line only */
@@ -112,19 +137,24 @@
 /* ---------- sidebar mini lyrics ---------- */
 .sl-mini {
   --lyrics-color-background: rgb(83, 83, 83); --lyrics-color-inactive: rgba(255, 255, 255, .5); --lyrics-color-active: #fff; --sl-scale: 1;
-  --sl-mini-h: 420px;
-  container-type: inline-size; position: relative; flex: none; overflow: hidden; isolation: isolate;
-  margin: 0; border-radius: 8px; height: var(--sl-mini-h);
+  --sl-mini-h: 420px; --sl-mini-font: 18px;
+  position: relative; flex: none; overflow: hidden; isolation: isolate;
+  margin: 0; border-radius: 8px; width: 100%; height: var(--sl-mini-h);
+  /* Its size never depends on its content: line changes stay inside, the sidebar is not re-laid out. */
+  contain: strict;
   color: var(--lyrics-color-active);
 }
-/* Follows playback only (scrolled from script): the wheel keeps scrolling the sidebar itself. */
+/* Follows playback only (scrolled from script): the wheel keeps scrolling the sidebar itself.
+ * At the start the lyrics sit at the top (no top fade); the top fades once they have scrolled. */
 .sl-mini-scroll { position: absolute; inset: 0; overflow: hidden; scrollbar-width: none;
+  -webkit-mask-image: linear-gradient(180deg, #000 84%, transparent); mask-image: linear-gradient(180deg, #000 84%, transparent); }
+.sl-mini-scroll.sl-scrolled {
   -webkit-mask-image: linear-gradient(180deg, transparent, #000 16%, #000 84%, transparent); mask-image: linear-gradient(180deg, transparent, #000 16%, #000 84%, transparent); }
 .sl-mini-scroll::-webkit-scrollbar { display: none; }
 .sl-mini-lines {
-  position: relative; padding: calc(var(--sl-mini-h) * .42) 16px; box-sizing: border-box; display: flex; flex-direction: column;
+  position: relative; padding: 16px 16px calc(var(--sl-mini-h) * .42); box-sizing: border-box; display: flex; flex-direction: column;
   font-family: var(--encore-title-font-stack, sans-serif); font-weight: 700; line-height: 1.3; text-wrap: balance;
-  font-size: calc(clamp(15px, 7cqw, 28px) * var(--sl-scale));
+  font-size: calc(var(--sl-mini-font) * var(--sl-scale));
 }
 .sl-mini .sl-line { margin-bottom: .65em; }
 .sl-mini .sl-trans { font-size: .72em; margin-top: .15em; }
@@ -345,5 +375,5 @@ button.sl-pill-icon:hover { background: rgba(0, 0, 0, .6); }
 .sl-toast.sl-visible { opacity: 1; transform: translate(-50%, 0); }
 
 @media (prefers-reduced-motion: reduce) {
-  .sl-bg, .sl-bg::before, .sl-bg::after, .sl-sync, .sl-toast, .sl-panel, .sl-upload { transition: none; animation: none; }
+  .sl-bg, .sl-bg::before, .sl-bg::after, .sl-sync, .sl-toast, .sl-panel, .sl-upload, .sl-dialog, .sl-dialog-backdrop { transition: none; animation: none; }
 }

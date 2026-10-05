@@ -109,27 +109,35 @@ test('relay: only the allow-list is forwarded; RELAY=0 turns it off', async (t) 
   assert.equal((await (await fetch(`${off.base}/health`)).json()).relay, false);
 });
 
-test('"使用此歌词" uploads match + lyrics; the latest choice wins; other clients get it; unbind removes it', async (t) => {
+test('"使用此歌词" binds on this machine only; the upload button shares it; the latest upload wins; unbind', async (t) => {
   const s = await start(); t.after(s.close);
   const engine = client(s.base);
   await engine.setTrack(SUNNY);
+  assert.equal(engine.remote, null, 'nothing on the server');
+  assert.equal(engine.remoteState(), 'none');
   const result = await engine.search('晴天 周杰伦');
   const [first, second] = result.providers[0].candidates;
   assert.equal(result.providers[0].candidates.length, 2);
   const preview = await engine.preview(first);
   assert.equal(preview.lines[0].text, '故事的小黄花');
 
-  assert.equal((await engine.bind(first, preview)).stored, 'local');
-  assert.equal(engine.origin, 'cloud');
+  assert.equal(await engine.bind(first, preview), true);
+  assert.equal(engine.origin, 'manual');
+  assert.equal(s.bucket.puts, 0, 'binding never uploads by itself');
+  await engine.upload();
+  assert.equal(engine.remoteState(), 'same');
   let doc = JSON.parse(s.bucket.objects.get(KEY).body);
   assert.equal(doc.spotify_url, 'https://open.spotify.com/track/0RiRZpuVRbi7oqRdSMwhQY');
   assert.equal(doc.match.id, first.id);
   assert.equal(doc.match.url, `https://music.163.com/#/song?id=${first.id}`);
   assert.match(doc.lrc, /故事的小黄花/);
-  assert.equal(doc.lyrics.lines[0].text, '故事的小黄花');
+  assert.equal(doc.offset_ms, 0);
 
-  // Switching lyrics overwrites the same object.
+  // Another choice stays local until uploaded; then it overwrites the same object.
   await engine.bind(second, await engine.preview(second));
+  assert.equal(engine.remoteState(), 'lyrics');
+  assert.equal(JSON.parse(s.bucket.objects.get(KEY).body).match.id, first.id);
+  await engine.upload();
   doc = JSON.parse(s.bucket.objects.get(KEY).body);
   assert.equal(s.bucket.objects.size, 1);
   assert.equal(doc.match.id, second.id);
@@ -148,8 +156,17 @@ test('"使用此歌词" uploads match + lyrics; the latest choice wins; other cl
   const info = await (await fetch(`${s.base}/api/bindings/0RiRZpuVRbi7oqRdSMwhQY`)).json();
   assert.equal(info.binding.match.id, second.id);
   assert.equal(info.binding.lrc, undefined, 'the LRC copy stays in the bucket');
+  // A binding made on this machine comes before the server copy.
+  await other.bind(first, await other.preview(first));
+  await other.setTrack(null); await other.setTrack(SUNNY);
+  assert.equal(other.match.id, first.id);
+  assert.equal(other.remoteState(), 'lyrics');
 
-  await engine.unbind();
+  // Unbinding locally keeps the server copy (it applies again); remote: true deletes it.
+  await other.unbind();
+  assert.equal(other.status, '云端歌词 · 网易云音乐');
+  assert.equal(s.bucket.objects.size, 1);
+  await engine.unbind({ remote: true });
   assert.equal(s.bucket.objects.size, 0);
   assert.equal((await fetch(`${s.base}/api/bindings/0RiRZpuVRbi7oqRdSMwhQY`)).status, 404);
   assert.equal(engine.status, '已匹配歌词 · 网易云音乐', 'unbind rematches automatically');
@@ -180,6 +197,77 @@ test('upload button: current lyrics (automatic match or local LRC) go to the ser
   assert.equal((await post('/api/bind', { track: SUNNY, lyrics: core.parseLrc('[00:01.00]x', null, 'spotify') })).status, 422);
 });
 
+test('upload button: the server copy is looked up fresh before uploading', async (t) => {
+  const s = await start(); t.after(s.close);
+  const engine = client(s.base);
+  await engine.setTrack(SUNNY);
+  assert.equal(await engine.remoteBinding(), null, 'nothing stored yet');
+  // Another device stores lyrics meanwhile; the local cache of this client does not know.
+  const other = client(s.base);
+  await other.setTrack(SUNNY);
+  await other.upload();
+  const doc = await engine.remoteBinding();
+  assert.equal(doc.match.id, '7');
+  assert.equal(doc.lyrics.lines[0].text, '故事的小黄花');
+});
+
+test('track offset: stays local until uploaded, then travels with the lyrics', async (t) => {
+  const s = await start(); t.after(s.close);
+  const engine = client(s.base);
+  await engine.setTrack(SUNNY);
+  engine.setOffset(300, false);
+  await new Promise(r => setTimeout(r, 50));
+  assert.equal(s.bucket.puts, 0, 'changing the offset never uploads');
+  await engine.upload();
+  let doc = JSON.parse(s.bucket.objects.get(KEY).body);
+  assert.equal(doc.offset_ms, 300);
+  assert.equal(engine.remoteState(), 'same');
+  engine.setOffset(-700, false);
+  assert.equal(engine.remoteState(), 'offset', 'the upload button shows the change');
+  assert.equal(JSON.parse(s.bucket.objects.get(KEY).body).offset_ms, 300);
+  await engine.upload();
+  doc = JSON.parse(s.bucket.objects.get(KEY).body);
+  assert.equal(doc.offset_ms, -700);
+  assert.equal(doc.match.id, '7');
+
+  // Another device gets the lyrics with their offset, until it sets its own.
+  const other = client(s.base);
+  await other.setTrack(SUNNY);
+  assert.equal(other.status, '云端歌词 · 网易云音乐');
+  assert.equal(other.offset(), -700);
+  assert.equal(other.remoteState(), 'same');
+  other.setOffset(100, false);
+  assert.equal(other.offset(), 100);
+  assert.equal(other.remoteState(), 'offset');
+  // Uploads without an offset (older clients) keep the stored one; values are bounded.
+  const post = (path, body) => fetch(s.base + path, { method: 'POST', body: JSON.stringify(body) });
+  assert.equal((await post('/api/bind', { track: SUNNY, lyrics: core.parseLrc('[00:01.00]x', null, 'local') })).status, 200);
+  assert.equal(JSON.parse(s.bucket.objects.get(KEY).body).offset_ms, -700);
+  assert.equal((await post('/api/bind', { track: SUNNY, offset_ms: 99999, lyrics: core.parseLrc('[00:01.00]x', null, 'local') })).status, 200);
+  assert.equal(JSON.parse(s.bucket.objects.get(KEY).body).offset_ms, 5000);
+  assert.equal((await post('/api/offset', { track: SUNNY, offset_ms: 1 })).status, 404, 'no separate offset endpoint');
+});
+
+test('prefetch: upcoming tracks are matched in the background; playing them needs no request', async (t) => {
+  const s = await start(); t.after(s.close);
+  const local = [];
+  const engine = client(s.base, { local });
+  const other = { uri: 'spotify:track:bbbbbbbbbbbbbbbbbbbbbb', title: '晴天', artists: ['周杰伦'], album: '叶惠美', duration_ms: 269000 };
+  engine.prefetch([SUNNY, other, { ...SUNNY, uri: 'spotify:track:cccccccccccccccccccccc' }]);
+  assert.equal(engine.lyrics, null, 'nothing shown while prefetching');
+  assert.equal(engine.status, '等待播放器');
+  // Starting a track that is being prefetched waits for it instead of matching twice.
+  await engine.setTrack(SUNNY);
+  assert.equal(engine.lyrics.lines[0].text, '故事的小黄花');
+  while (engine.prefetchActive) await new Promise(r => setTimeout(r, 10));
+  assert.equal(engine.prefetched.size, 2, 'only the next two');
+  const before = local.length;
+  await engine.setTrack(other);
+  assert.equal(engine.status, '歌词缓存');
+  assert.equal(engine.lyrics.lines[0].text, '故事的小黄花');
+  assert.equal(local.length, before, 'served from the prefetch');
+});
+
 test('server: bind validates input', async (t) => {
   const s = await start(); t.after(s.close);
   const post = (path, body) => fetch(s.base + path, { method: 'POST', body: JSON.stringify(body) });
@@ -205,8 +293,8 @@ test('local files stay on the client; origin allow-list and optional token', asy
   const engine = client(s.base, { headers: { Authorization: 'Bearer secret' } });
   const local = { uri: 'spotify:local:Artist:Album:Song:200', title: 'Song', artists: ['Artist'], album: 'Album', duration_ms: 200000 };
   await engine.setTrack(local);
-  const result = await engine.bind({ provider: 'netease', id: '7' }, core.parseLrc('[00:01.00]local', null, 'netease'));
-  assert.equal(result.local, true);
+  assert.equal(await engine.bind({ provider: 'netease', id: '7' }, core.parseLrc('[00:01.00]local', null, 'netease')), true);
+  await assert.rejects(engine.upload(), /本地文件/);
   assert.equal(s.bucket.puts, 0);
 
   const evil = await fetch(`${s.base}/api/bind`, { method: 'POST', headers: { Origin: 'https://evil.example' }, body: '{}' });
@@ -219,9 +307,9 @@ test('local files stay on the client; origin allow-list and optional token', asy
   await anonymous.setTrack(SUNNY);
   assert.equal(anonymous.status, '已匹配歌词 · 网易云音乐');
   assert.match(anonymous.cloudError, /需要歌词服务器令牌/);
-  const r = await anonymous.bind(anonymous.match, anonymous.lyrics);
-  assert.match(r.error, /需要歌词服务器令牌/);
-  assert.equal(anonymous.status, '已绑定歌词 · 网易云音乐', 'still bound on this machine');
+  assert.equal(await anonymous.bind(anonymous.match, anonymous.lyrics), true);
+  assert.equal(anonymous.status, '已绑定歌词 · 网易云音乐', 'bound on this machine');
+  await assert.rejects(anonymous.upload(), /需要歌词服务器令牌/);
   const authorized = client(s.base, { headers: { Authorization: 'Bearer secret' } });
   await authorized.setTrack(SUNNY);
   await authorized.upload();
@@ -235,8 +323,7 @@ test('pure local mode: no lyrics server is contacted; bindings stay on this mach
   await engine.setTrack(SUNNY);
   assert.equal(engine.status, '已匹配歌词 · 网易云音乐');
   const [first, second] = (await engine.search('晴天 周杰伦')).providers[0].candidates;
-  const result = await engine.bind(second, await engine.preview(second));
-  assert.equal(result.offline, true);
+  assert.equal(await engine.bind(second, await engine.preview(second)), true);
   assert.equal(engine.origin, 'manual');
   assert.equal(engine.lyrics.lines[0].text, '第二个版本');
   await assert.rejects(engine.upload(), /纯本地/);

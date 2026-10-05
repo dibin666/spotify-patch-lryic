@@ -8,7 +8,7 @@ package server
  * server only
  *   - stores shared matches: one object per Spotify track in Cloudflare R2 with the
  *     chosen NetEase / QQ song and its lyrics ("使用此歌词" / the upload button);
- *     the latest upload wins;
+ *     the latest upload wins; the track's timing offset is uploaded with the lyrics;
  *   - relays provider requests verbatim for clients whose renderer cannot reach
  *     NetEase / QQ directly (CORS). Only an allow-list of hosts and API paths is
  *     forwarded and nothing is interpreted (RELAY=0 turns this off).
@@ -215,11 +215,41 @@ type bindingDoc struct {
 	LineCount    int       `json:"line_count"`
 	Translated   bool      `json:"translated"`
 	LyricsSHA256 string    `json:"lyrics_sha256"`
+	OffsetMS     int64     `json:"offset_ms"`
 	BindCount    int       `json:"bind_count"`
 	CreatedAt    string    `json:"created_at"`
 	UpdatedAt    string    `json:"updated_at"`
 	LRC          string    `json:"lrc"`
 	Lyrics       *Lyrics   `json:"lyrics"`
+}
+
+/* Per-track timing offset ("偏移"), bounded like the client's. */
+const maxOffset = 5000
+
+func cleanOffset(v any) (int64, bool) {
+	f, ok := finite(v)
+	if !ok {
+		return 0, false
+	}
+	return clampInt(f, -maxOffset, maxOffset), true
+}
+
+func bindingMetadata(doc *bindingDoc) map[string]string {
+	metadata := map[string]string{"spotify-url": doc.SpotifyURL, "source": doc.Source}
+	if doc.Match != nil {
+		metadata["provider"] = doc.Match.Provider
+		metadata["provider-id"] = doc.Match.ID
+	}
+	return metadata
+}
+
+func (a *App) saveError(id string, err error) error {
+	log.Printf("[storage] put %s %v", id, err)
+	name := "存储"
+	if a.storage == "r2" {
+		name = "R2"
+	}
+	return &HTTPError{502, fmt.Sprintf("保存到 %s失败：%v", name, err)}
 }
 
 /* "使用此歌词" or the upload button: the lyrics come from the client. */
@@ -250,6 +280,7 @@ func (a *App) bind(ctx context.Context, body obj) (any, error) {
 	lyrics.TrackURI = "spotify:track:" + id
 	lyrics.TrackID = id
 	spotifyURL := "https://open.spotify.com/track/" + id
+	offset, hasOffset := cleanOffset(body["offset_ms"])
 
 	var result any
 	var resultErr error
@@ -264,7 +295,7 @@ func (a *App) bind(ctx context.Context, body obj) (any, error) {
 		doc := &bindingDoc{
 			SpotifyURL: spotifyURL, SpotifyURI: "spotify:track:" + id, Track: track,
 			Source: lyrics.Source, SyncType: lyrics.SyncType, LineCount: len(lyrics.Lines),
-			LyricsSHA256: hex.EncodeToString(sum[:]), BindCount: 1, CreatedAt: now, UpdatedAt: now, LRC: lrc, Lyrics: lyrics,
+			LyricsSHA256: hex.EncodeToString(sum[:]), OffsetMS: offset, BindCount: 1, CreatedAt: now, UpdatedAt: now, LRC: lrc, Lyrics: lyrics,
 		}
 		for _, l := range lyrics.Lines {
 			if l.TranslatedText != "" {
@@ -279,21 +310,17 @@ func (a *App) bind(ctx context.Context, body obj) (any, error) {
 			if s, ok := previous["created_at"].(string); ok && s != "" {
 				doc.CreatedAt = s
 			}
+			/* Older clients send no offset: the stored one stays. */
+			if n, ok := cleanOffset(previous["offset_ms"]); ok && !hasOffset {
+				doc.OffsetMS = n
+			}
 		}
-		metadata := map[string]string{"spotify-url": spotifyURL, "source": lyrics.Source}
 		if candidate != nil {
 			doc.Match = candidate.doc()
-			metadata["provider"] = candidate.Provider
-			metadata["provider-id"] = candidate.ID
 		}
-		saved, err := a.bindings.Save(ctx, id, doc, metadata)
+		saved, err := a.bindings.Save(ctx, id, doc, bindingMetadata(doc))
 		if err != nil {
-			log.Printf("[storage] put %s %v", id, err)
-			name := "存储"
-			if a.storage == "r2" {
-				name = "R2"
-			}
-			resultErr = &HTTPError{502, fmt.Sprintf("保存到 %s失败：%v", name, err)}
+			resultErr = a.saveError(id, err)
 			return
 		}
 		result = obj{"stored": a.storage, "updated_at": now, "binding": publicDoc(saved)}

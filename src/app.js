@@ -49,6 +49,7 @@
     el.setAttribute('fill', 'currentColor'); el.setAttribute('aria-hidden', 'true');
     el.innerHTML = path; return el;
   };
+  const STROKE = 'fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"';
   const ICON = {
     lyrics: '<path d="M1.5 2.75h9v1.5h-9zm0 4h6.5v1.5H1.5zm0 4h5v1.5h-5z"/><path d="M12.25 2.5h2.75V4.3h-1.25v7.45a2.25 2.25 0 1 1-1.5-2.12z"/>',
     search: '<path d="M7 1.75a5.25 5.25 0 1 0 3.17 9.44l3.32 3.32 1.06-1.06-3.32-3.32A5.25 5.25 0 0 0 7 1.75M3.25 7a3.75 3.75 0 1 1 7.5 0 3.75 3.75 0 0 1-7.5 0"/>',
@@ -59,8 +60,9 @@
     minus: '<path d="M2 7.25h12v1.5H2z"/>',
     plus: '<path d="M7.25 2v5.25H2v1.5h5.25V14h1.5V8.75H14v-1.5H8.75V2z"/>',
     note: '<path d="M10 1.5v8.27A2.5 2.5 0 1 0 11.5 12V4.6l3-.86V1.95l-4.5 1.3z"/>',
-    upload: '<path d="M8 1.94 12.03 6l-1.06 1.06-2.22-2.22v6.41h-1.5V4.84L5.03 7.06 3.97 6z"/><path d="M2 10.5h1.5v2h9v-2H14V14H2z"/>',
-    uploaded: '<path d="M13.53 3.47a.75.75 0 0 1 0 1.06L6.5 11.56 2.47 7.53a.75.75 0 1 1 1.06-1.06L6.5 9.44l5.97-5.97a.75.75 0 0 1 1.06 0"/><path d="M2 12.5h12V14H2z"/>',
+    /* Cloud + arrow: upload to the lyrics server; cloud + check: the server has these lyrics. */
+    upload: `<path ${STROKE} d="M5.25 12.5h-1a3 3 0 0 1-.43-5.97 4.25 4.25 0 0 1 8.3-.78A3.38 3.38 0 0 1 11.75 12.5h-1"/><path ${STROKE} d="M8 14.25V8.5m-2.25 2.25L8 8.5l2.25 2.25"/>`,
+    uploaded: `<path ${STROKE} d="M4.25 12.5a3 3 0 0 1-.43-5.97 4.25 4.25 0 0 1 8.3-.78A3.38 3.38 0 0 1 11.75 12.5z"/><path ${STROKE} d="m5.9 9.4 1.45 1.45 2.85-2.85"/>`,
   };
 
   /* ------------------------------------------------------- platform ----- */
@@ -329,7 +331,7 @@
       this.state = this.playerAPI.getState();
       this.open = false; this.ignoreNav = 0;
       this.pendingTrack = undefined;
-      this.colorCache = new Map();
+      this.colorCache = new Map(); this.blurCache = new Map();
       relayAllowed = () => this.store.setting('relay') !== false;
       this.engine = new Core.Engine({
         store: this.store, http: new Core.Http(providerTransport), cloud: pureLocal() ? null : cloud,
@@ -337,6 +339,7 @@
         spotify: (track, signal) => this.spotifyLyrics(track, signal),
         onChange: () => this.onEngine(),
       });
+      this.upcomingKey = ''; this.prefetchTimer = 0;
     }
     async start() {
       await this.store.open();
@@ -369,9 +372,10 @@
       try { return this.platform.getSession().accessToken; } catch (_) { return null; }
     }
     /* Playback ----------------------------------------------------- */
-    track(state = this.state) {
-      const item = state && state.item;
+    track(state = this.state) { return this.trackOf(state && state.item, state && state.duration); }
+    trackOf(item, duration) {
       if (!item || (item.type && item.type !== 'track' && item.type !== 'local')) return null;
+      if (/^spotify:(delimiter|ad|episode)(:|$)/.test(item.uri || '')) return null;
       const meta = item.metadata || {};
       const images = (item.album && item.album.images) || item.images || [];
       const pick = label => (images.find(i => i.label === label) || {}).url;
@@ -379,7 +383,7 @@
         uri: item.uri || '', title: item.name || meta.title || '',
         artists: (item.artists || []).map(a => a.name).filter(Boolean),
         album: (item.album && item.album.name) || meta.album_title || '',
-        duration_ms: (item.duration && item.duration.milliseconds) || state.duration || 0,
+        duration_ms: (item.duration && item.duration.milliseconds) || duration || 0,
         image: pick('small') || pick('standard') || (images[0] || {}).url || '',
         imageLarge: pick('xlarge') || pick('large') || pick('standard') || '',
         has_lyrics: meta.has_lyrics === 'true' ? true : meta.has_lyrics === 'false' ? false : undefined,
@@ -410,17 +414,55 @@
         if (this.open) this.view.trackChanged();
         if (this.mini) this.mini.trackChanged();
       }
+      /* The next songs are matched ahead of time (queue edits, shuffle and skips included). */
+      const next = this.upcoming(state).map(t => t.uri || t.title).join('\n');
+      if (next !== this.upcomingKey) { this.upcomingKey = next; this.schedulePrefetch(2500); }
       if (this.open) this.view.reschedule();
+    }
+    /* The next two songs: Spotify's player state lists them (queued songs first, then the
+     * context); its queue API is the fallback. */
+    upcoming(state = this.state) {
+      let items = state && Array.isArray(state.nextItems) ? state.nextItems : null;
+      if (!items || !items.length) {
+        try {
+          const queue = typeof this.playerAPI.getQueue === 'function' ? this.playerAPI.getQueue() : null;
+          if (queue && typeof queue.then !== 'function') items = [...(queue.queued || []), ...(queue.nextUp || [])];
+        } catch (_) { /* not available in this Spotify version */ }
+      }
+      const out = [];
+      for (const item of items || []) {
+        const info = this.trackOf(item, 0);
+        if (!info || !info.title || Core.trackEqual(info, this.currentTrack) || out.some(t => t.uri === info.uri)) continue;
+        out.push(info);
+        if (out.length >= 2) break;
+      }
+      return out;
+    }
+    schedulePrefetch(delay) {
+      clearTimeout(this.prefetchTimer);
+      this.prefetchTimer = setTimeout(() => {
+        if (this.store.setting('prefetch') === false) return;
+        /* The playing song first: wait until its lyrics are settled. */
+        if (this.engine.busy) { this.schedulePrefetch(2000); return; }
+        const tracks = this.upcoming().map(t => ({
+          uri: t.uri, title: t.title, artists: t.artists, album: t.album, duration_ms: t.duration_ms,
+          has_lyrics: t.has_lyrics, image: t.imageLarge || t.image || '',
+        }));
+        if (tracks.length) this.engine.prefetch(tracks);
+      }, delay);
     }
     onEngine() { if (this.open) this.view.engineChanged(); this.entry && this.entry.refresh(); this.mini && this.mini.render(); }
     /* Spotify lyrics (fallback source) -------------------------------- */
     async spotifyLyrics(track, signal) {
+      /* Upcoming songs (prefetch) bring their own metadata. */
       const info = this.trackInfo && this.trackInfo.uri === track.uri ? this.trackInfo : null;
-      if (info && info.has_lyrics === false) return undefined;
+      const hasLyrics = info ? info.has_lyrics : track.has_lyrics;
+      if (hasLyrics === false) return undefined;
       const id = Core.spotifyId(track.uri);
       const token = this.token();
       if (!id || !token) return undefined;
-      const image = info && info.imageLarge ? info.imageLarge.replace('spotify:image:', 'https://i.scdn.co/image/') : '';
+      const cover = info ? info.imageLarge : track.image;
+      const image = cover ? cover.replace('spotify:image:', 'https://i.scdn.co/image/') : '';
       const url = `https://spclient.wg.spotify.com/color-lyrics/v2/track/${id}${image ? '/image/' + encodeURIComponent(image) : ''}?format=json&vocalRemoval=false&market=from_token`;
       const response = await fetch(url, { headers: { authorization: 'Bearer ' + token, 'app-platform': 'WebPlayer', 'spotify-app-version': this.platform.version || '' }, signal });
       if (response.status === 404 || response.status === 403 || response.status === 204) return null;
@@ -475,7 +517,12 @@
       let mode = this.store.setting('color_mode');
       if (!BACKGROUNDS[mode] && mode !== 'cover') mode = 'cover';
       const cover = info && (info.imageLarge || info.image) ? (info.imageLarge || info.image).replace('spotify:image:', 'https://i.scdn.co/image/') : '';
-      const image = cover ? `url("${cover.replace(/["\\]/g, '')}")` : 'none';
+      let image = 'none';
+      if (mode === 'blur' && cover) {
+        const blurred = await this.blurredCover(cover);
+        if (this.trackInfo !== info || this.store.setting('color_mode') !== mode) return null;
+        if (blurred) image = `url("${blurred}")`;
+      }
       let colors = BACKGROUNDS[mode];
       if (mode === 'cover') {
         /* Spotify's lyric colours (when available) are softened the same way. */
@@ -487,6 +534,31 @@
         colors = hsl ? softPalette(hsl) : BACKGROUNDS.neutral;
       }
       return { mode, image, colors };
+    }
+    /* "封面模糊": the cover blurred once into a small image. A CSS blur filter over the whole
+     * page was re-rendered on every frame anything above it changed (hover, word highlight). */
+    async blurredCover(url) {
+      if (this.blurCache.has(url)) return this.blurCache.get(url);
+      const blurred = await new Promise(resolve => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous'; img.decoding = 'async';
+        img.onload = () => {
+          try {
+            const size = 96, pad = size * 0.2, canvas = document.createElement('canvas');
+            canvas.width = canvas.height = size;
+            const ctx = canvas.getContext('2d');
+            ctx.filter = 'blur(7px) saturate(1.15) brightness(.62)';
+            /* Drawn larger than the canvas so the blur has no transparent edges. */
+            ctx.drawImage(img, -pad, -pad, size + 2 * pad, size + 2 * pad);
+            canvas.toBlob(blob => resolve(blob ? URL.createObjectURL(blob) : null), 'image/png');
+          } catch (_) { resolve(null); }
+        };
+        img.onerror = () => resolve(null);
+        img.src = url;
+      });
+      if (this.blurCache.size >= 8) { const [oldest, old] = this.blurCache.entries().next().value; this.blurCache.delete(oldest); if (old) setTimeout(() => URL.revokeObjectURL(old), 5000); }
+      this.blurCache.set(url, blurred);
+      return blurred;
     }
     /* Album colour, Spotify style ------------------------------------- */
     async coverColor(imageUri) {
@@ -581,7 +653,7 @@
         class: 'sl-entry', onclick: () => app.toggle(), ...hover(() => this.button, () => '第三方歌词'),
       }, h('span', { class: 'sl-entry-icon', 'aria-hidden': 'true' }, svg(ICON.lyrics)));
       /* Small companion button: uploads the lyrics on screen to the lyrics server. */
-      this.uploadIcon = h('span', { class: 'sl-upload-icon', 'aria-hidden': 'true' }, svg(ICON.upload, 14));
+      this.uploadIcon = h('span', { class: 'sl-upload-icon', 'aria-hidden': 'true' }, svg(ICON.upload));
       this.uploadButton = h('button', {
         type: 'button', 'data-testid': 'spot-lyric-upload', 'aria-label': '上传当前歌词到服务器', class: 'sl-upload',
         onclick: () => this.upload(), ...hover(() => this.uploadButton, () => this.uploadHint()),
@@ -624,10 +696,11 @@
       this.button.dataset.has = String(Core.lyricsUsable(lyrics));
       /* Pure local mode has no server to upload to. */
       this.uploadButton.hidden = pureLocal();
-      const blocked = !!this.uploadBlocked(), saved = !blocked && this.app.engine.origin === 'cloud';
+      const blocked = !!this.uploadBlocked(), saved = !blocked && this.app.engine.remoteState() === 'same';
       this.uploadButton.dataset.state = this.uploading ? 'busy' : blocked ? 'off' : saved ? 'saved' : 'ready';
       this.uploadButton.setAttribute('aria-disabled', String(blocked));
-      if (this.uploadIconState !== saved) { this.uploadIconState = saved; this.uploadIcon.replaceChildren(svg(saved ? ICON.uploaded : ICON.upload, 14)); }
+      if (this.uploadIconState !== saved) { this.uploadIconState = saved; this.uploadIcon.replaceChildren(svg(saved ? ICON.uploaded : ICON.upload)); }
+      this.uploadButton.setAttribute('aria-label', this.uploadHint());
       if (this.tipOwner === this.uploadButton) this.tooltip(this.uploadButton, this.uploadHint());
     }
     uploadBlocked() {
@@ -640,25 +713,49 @@
       return '';
     }
     uploadHint() {
-      if (this.uploading) return '正在上传…';
+      if (this.uploading) return this.uploading === 'check' ? '正在检查服务器…' : '正在上传…';
       const blocked = this.uploadBlocked();
       if (blocked) return blocked;
       const engine = this.app.engine, source = NAMES[engine.lyrics.source] || engine.lyrics.source;
-      return engine.origin === 'cloud' ? `当前歌词已保存在服务器（${source}），点击重新上传` : `上传当前歌词到服务器（${source}）`;
+      return ({
+        same: `服务器上已是当前歌词和偏移（${source}）`,
+        offset: '偏移已修改，点击上传到服务器',
+        lyrics: `服务器上是另一份歌词，点击用当前歌词（${source}）覆盖`,
+      })[engine.remoteState()] || `上传歌词和偏移到服务器（${source}）`;
     }
+    /* The server is asked first: lyrics someone already stored are only replaced after a confirmation. */
     async upload() {
       if (this.uploading) return;
       const blocked = this.uploadBlocked();
       if (blocked) { toast(blocked); return; }
-      this.uploading = true; this.refresh();
-      try { await this.app.engine.upload(); toast('已上传当前歌词到歌词服务器'); }
-      catch (e) { toast('上传失败：' + (e.message || e)); }
+      const engine = this.app.engine, track = engine.track;
+      this.uploading = 'check'; this.refresh();
+      try {
+        let existing;
+        try { existing = await engine.remoteBinding(); }
+        catch (e) { toast('无法检查歌词服务器：' + (e.message || e)); return; }
+        if (!Core.trackEqual(engine.track, track)) return;
+        if (existing && engine.remoteState() === 'same') { toast('服务器上已是当前的歌词和偏移，无需上传'); return; }
+        if (existing) {
+          this.uploading = false; this.refresh();
+          const ok = await confirmDialog(overwriteText(existing, engine));
+          if (!ok) return;
+          if (!Core.trackEqual(engine.track, track)) { toast('歌曲已切换，未上传'); return; }
+          const again = this.uploadBlocked();
+          if (again) { toast(again); return; }
+        }
+        this.uploading = 'upload'; this.refresh();
+        await engine.upload();
+        toast(existing ? '已覆盖服务器上的歌词和偏移' : '已上传当前歌词和偏移到歌词服务器');
+      } catch (e) { toast('上传失败：' + (e.message || e)); }
       finally { this.uploading = false; this.refresh(); }
     }
     tooltip(owner, text) {
       this.tipOwner = owner;
       if (!owner) { this.tip.remove(); return; }
       this.tip.textContent = text;
+      /* Measured at the origin: a previous position near the edge would squeeze the width. */
+      this.tip.style.left = '0px'; this.tip.style.top = '0px';
       document.body.append(this.tip);
       const r = owner.getBoundingClientRect(), t = this.tip.getBoundingClientRect();
       this.tip.style.left = `${Math.round(clamp(r.left + r.width / 2 - t.width / 2, 8, innerWidth - t.width - 8))}px`;
@@ -666,16 +763,76 @@
     }
   }
 
+  /* What the overwrite confirmation says about the copy on the server. */
+  function overwriteText(doc, engine) {
+    const lyrics = engine.lyrics;
+    const stored = NAMES[(doc.match && doc.match.provider) || doc.source] || doc.source || '未知来源';
+    const current = NAMES[lyrics.source] || lyrics.source;
+    const kind = { word: '逐字同步', line: '逐行同步', unsynced: '未同步' }[doc.sync_type || (doc.lyrics && doc.lyrics.sync_type)] || '';
+    const date = new Date(doc.updated_at || '');
+    const pad = n => String(n).padStart(2, '0');
+    const when = isNaN(date) ? '' : `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    const lines = (doc.lyrics && doc.lyrics.lines) || [];
+    const remoteOffset = typeof doc.offset_ms === 'number' ? doc.offset_ms : 0;
+    const offsetOnly = engine.remoteState() === 'offset';
+    return {
+      title: '服务器上已有这首歌的歌词',
+      body: [
+        `已保存：${stored}${kind ? ' · ' + kind : ''} · ${lines.length} 行 · 偏移 ${fmtOffset(remoteOffset)}`,
+        when ? `更新于 ${when}${doc.bind_count > 1 ? ` · 已上传 ${doc.bind_count} 次` : ''}` : null,
+        offsetOnly ? `歌词相同，只有偏移不同。要把偏移改为 ${fmtOffset(engine.trackOffset(engine.track))} 吗？`
+          : `要用当前显示的歌词（${current} · 偏移 ${fmtOffset(engine.trackOffset(engine.track))}）覆盖它吗？所有使用这台服务器的设备都会看到新的歌词。`,
+      ],
+      confirm: offsetOnly ? '更新偏移' : '覆盖',
+    };
+  }
+  /* Spotify-style modal; resolves true when confirmed (Enter), false on the cancel button, null on Esc / backdrop. */
+  function confirmDialog({ title, body, confirm = '确定', cancel = '取消' }) {
+    return new Promise(resolve => {
+      const previous = document.activeElement;
+      const done = value => {
+        document.removeEventListener('keydown', onKey, true);
+        backdrop.remove();
+        if (previous && previous.focus) previous.focus({ preventScroll: true });
+        resolve(value);
+      };
+      const onKey = event => {
+        if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); done(null); }
+        else if (event.key === 'Enter' && !(event.target && event.target.closest && event.target.closest('.sl-dialog-cancel'))) { event.preventDefault(); event.stopPropagation(); done(true); }
+      };
+      const ok = h('button', { type: 'button', class: 'sl-btn sl-btn-green', onclick: () => done(true) }, confirm);
+      const dialog = h('div', { class: 'sl-dialog', role: 'alertdialog', 'aria-modal': 'true', 'aria-labelledby': 'sl-dialog-title' },
+        h('h2', { class: 'sl-dialog-title', id: 'sl-dialog-title' }, title),
+        ...[].concat(body).filter(Boolean).map(text => h('p', { class: 'sl-dialog-text' }, text)),
+        h('div', { class: 'sl-dialog-actions' },
+          h('button', { type: 'button', class: 'sl-btn sl-btn-ghost sl-dialog-cancel', onclick: () => done(false) }, cancel), ok));
+      const backdrop = h('div', { class: 'sl-dialog-backdrop', onmousedown: event => { if (event.target === backdrop) done(null); } }, dialog);
+      document.addEventListener('keydown', onKey, true);
+      document.body.append(backdrop);
+      ok.focus({ preventScroll: true });
+    });
+  }
+
   /* Opening brackets (「 『 （ …) leave half an em blank at a line start, which makes those lines look
    * indented. Lines that begin with one get `sl-hang` (see app.css) so every line aligns left. */
   const HANG_RE = /^\s*[「『【〈《〔〖（［｛]/;
   const hangClass = text => HANG_RE.test(text || '') ? ' sl-hang' : '';
+  /* Custom properties are inherited by every line: they are only written when they change,
+   * otherwise each write restyles the whole lyrics tree. */
+  function setVar(el, name, value) {
+    const cache = el._slVars || (el._slVars = {});
+    if (cache[name] === value) return;
+    cache[name] = value;
+    el.style.setProperty(name, value);
+  }
+  const setText = (el, text) => { if (el.textContent !== text) el.textContent = text; };
+  const setHidden = (el, hidden) => { if (el.hidden !== hidden) el.hidden = hidden; };
   function applyTheme(el, theme) {
-    el.dataset.bg = theme.mode;
-    if (theme.mode === 'blur') el.style.setProperty('--sl-cover', theme.image);
-    el.style.setProperty('--lyrics-color-background', theme.colors.background);
-    el.style.setProperty('--lyrics-color-inactive', theme.colors.inactive);
-    el.style.setProperty('--lyrics-color-active', theme.colors.active);
+    if (el.dataset.bg !== theme.mode) el.dataset.bg = theme.mode;
+    setVar(el, '--sl-cover', theme.mode === 'blur' ? theme.image : 'none');
+    setVar(el, '--lyrics-color-background', theme.colors.background);
+    setVar(el, '--lyrics-color-inactive', theme.colors.inactive);
+    setVar(el, '--lyrics-color-active', theme.colors.active);
   }
 
   function scrollParent(el) {
@@ -743,17 +900,30 @@
       this.resize();
       this.update(true);
     }
-    /* From below the title down to the bottom of the visible sidebar (when scrolled to the top). */
+    /* From below the title down to the bottom of the visible sidebar (when scrolled to the top).
+     * Runs on every frame while the sidebar is dragged: it only reads the settled layout, writes
+     * what changed and re-centres the current line. The font size moves in whole pixels, so the
+     * lines are not re-shaped on every pixel of width (a cqw size did exactly that). */
     resize() {
       const port = this.scrollParent;
       if (!port || !this.el.isConnected) return;
       const top = this.el.getBoundingClientRect().top - port.getBoundingClientRect().top + port.scrollTop;
       const height = Math.round(Math.max(220, port.clientHeight - top - 16));
-      if (Math.abs(height - (this.height || 0)) < 2) return;
-      this.height = height;
-      this.el.style.setProperty('--sl-mini-h', `${height}px`);
-      this.active = -2;
-      this.update(true);
+      const font = clamp(Math.round(this.el.clientWidth * 0.07), 15, 28);
+      let changed = false;
+      if (Math.abs(height - (this.height || 0)) >= 2) { this.height = height; setVar(this.el, '--sl-mini-h', `${height}px`); changed = true; }
+      if (font !== this.font) { this.font = font; setVar(this.el, '--sl-mini-font', `${font}px`); changed = true; }
+      if (changed || this.width !== this.el.clientWidth) { this.width = this.el.clientWidth; this.center(false); }
+    }
+    /* Current line in the middle; before it gets there (the start of the song) the lyrics stay
+     * aligned to the top. scrollTop directly (scrollIntoView would also scroll Spotify's containers). */
+    center(smooth) {
+      const el = this.els[Math.max(this.active, 0)], port = this.scroller.clientHeight;
+      if (!el || !port) return;
+      const top = this.active < 0 ? 0 : Math.max(0, Math.round(el.offsetTop - (port - el.offsetHeight) / 2));
+      this.scroller.classList.toggle('sl-scrolled', top > 0);
+      if (smooth) this.scroller.scrollTo({ top, behavior: 'smooth' });
+      else if (this.scroller.scrollTop !== top) this.scroller.scrollTop = top;
     }
     refresh() {
       if (!this.enabled()) { this.el.remove(); this.sizer.disconnect(); clearInterval(this.timer); this.timer = 0; return; }
@@ -769,10 +939,10 @@
       if (!this.enabled()) return;
       const app = this.app, engine = app.engine, lyrics = engine.lyrics;
       app.theme().then(theme => { if (theme) applyTheme(this.el, theme); });
-      this.el.style.setProperty('--sl-scale', String(app.store.setting('font_scale') || 1));
+      setVar(this.el, '--sl-scale', String(app.store.setting('font_scale') || 1));
       const usable = Core.lyricsUsable(lyrics) && !!app.currentTrack;
-      this.empty.hidden = usable;
-      this.scroller.hidden = !usable;
+      setHidden(this.empty, usable);
+      setHidden(this.scroller, !usable);
       if (!usable) {
         this.lyricsRef = null; this.lines = []; this.els = [];
         this.empty.textContent = !app.currentTrack ? '没有正在播放的歌曲' : engine.busy ? '正在加载歌词…' : engine.status === '纯音乐，没有歌词' ? '纯音乐，没有歌词' : '暂无歌词';
@@ -798,13 +968,16 @@
       if (!this.synced || !this.els.length || !this.el.isConnected || this.scroller.hidden) return;
       const index = Core.lyricsIndex(this.app.engine.lyrics, this.app.position() + this.app.engine.offset());
       if (index === this.active && !initial) return;
+      const previous = this.active;
       this.active = index;
-      this.els.forEach((el, i) => {
+      /* Only the lines whose state changed are touched. */
+      const lo = initial || previous < -1 ? 0 : Math.max(0, Math.min(previous, index));
+      const hi = initial || previous < -1 ? this.els.length - 1 : Math.min(this.els.length - 1, Math.max(previous, index));
+      for (let i = lo; i <= hi; i++) {
+        const el = this.els[i];
         el.classList.toggle('sl-past', i < index); el.classList.toggle('sl-active', i === index); el.classList.toggle('sl-future', i > index);
-      });
-      const el = this.els[Math.max(index, 0)], port = this.scroller.clientHeight;
-      if (!el || !port) return;
-      this.scroller.scrollTo({ top: el.offsetTop - (port - el.offsetHeight) / 2, behavior: initial ? 'auto' : 'smooth' });
+      }
+      this.center(!initial);
     }
   }
 
@@ -858,7 +1031,7 @@
         if (!line || !this.seekable) return;
         const data = this.lines[+line.dataset.i];
         if (!data) return;
-        line.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        this.scrollToLine(line, true);
         this.app.seek(data.start_time_ms - this.app.engine.offset());
       });
       /* The "Sync" button appears once the active line has been off-screen for a
@@ -912,15 +1085,17 @@
       const usable = Core.lyricsUsable(lyrics);
       const showTranslation = !!app.store.setting('translation');
       const hasTranslation = usable && lyrics.lines.some(l => l.translated_text);
-      this.page.style.setProperty('--sl-scale', String(app.store.setting('font_scale') || 1));
+      setVar(this.page, '--sl-scale', String(app.store.setting('font_scale') || 1));
       /* chrome */
-      this.translateBtn.hidden = !hasTranslation;
+      setHidden(this.translateBtn, !hasTranslation);
       this.translateBtn.classList.toggle('sl-on', showTranslation);
-      this.translateBtn.querySelector('.sl-pill-text').textContent = showTranslation ? '隐藏译文' : '显示译文';
+      setText(this.translateBtn.querySelector('.sl-pill-text'), showTranslation ? '隐藏译文' : '显示译文');
       const offset = app.engine.offset();
-      this.offsetLabel.textContent = `偏移 ${fmtOffset(offset)}`;
-      this.offsetPill.hidden = !usable || lyrics.sync_type === 'unsynced';
-      this.sourceText.textContent = usable ? `${NAMES[lyrics.source] || lyrics.provider_name || lyrics.source}` : '手动匹配';
+      setText(this.offsetLabel, `偏移 ${fmtOffset(offset)}`);
+      const offsetTitle = pureLocal() ? '点击重置本曲偏移' : '点击重置本曲偏移（点击播放栏的上传按钮，偏移会随歌词保存到服务器）';
+      if (this.offsetLabel.title !== offsetTitle) this.offsetLabel.title = offsetTitle;
+      setHidden(this.offsetPill, !usable || lyrics.sync_type === 'unsynced');
+      setText(this.sourceText, usable ? `${NAMES[lyrics.source] || lyrics.provider_name || lyrics.source}` : '手动匹配');
       this.applyColors();
       /* state overlay */
       const track = app.currentTrack;
@@ -945,7 +1120,7 @@
         };
       }
       this.renderState(state);
-      this.scroller.hidden = !usable;
+      setHidden(this.scroller, !usable);
       if (!usable) { this.lyricsRef = null; this.stop(); return; }
       if (!force && !this.needsScroll && this.lyricsRef === lyrics && this.showTranslation === showTranslation && this.wordSync === app.store.setting('word_sync')) { this.reschedule(); return; }
       /* rebuild lines */
@@ -978,7 +1153,7 @@
       this.visibility.disconnect();
       this.update(true);
       if (scrollToActive) {
-        if (this.active >= 0) this.els[this.active].scrollIntoView({ block: 'center', behavior: 'auto' });
+        if (this.active >= 0) this.scrollToLine(this.els[this.active], false);
         else this.scroller.scrollTop = 0;
       } else if (anchor) this.restoreAnchor(anchor);
       this.reschedule();
@@ -1004,7 +1179,7 @@
       if (Math.abs(delta) >= 1) this.scroller.scrollTop += delta;
     }
     renderState(state) {
-      this.stateBox.hidden = !state;
+      setHidden(this.stateBox, !state);
       if (!state) return;
       if (state.loading) { this.stateBox.replaceChildren(h('div', { class: 'sl-loader', 'aria-label': '正在加载' }, h('i'), h('i'), h('i'))); return; }
       const children = [h('p', { class: 'sl-state-title' }, state.title)];
@@ -1096,12 +1271,20 @@
       const inZone = line.top >= top && line.top <= bottom;
       if (!inZone && !jump) return;
       const smooth = inZone && !jump && document.visibilityState === 'visible' && !matchMedia('(prefers-reduced-motion: reduce)').matches;
-      el.scrollIntoView({ behavior: smooth ? 'smooth' : 'auto', block: 'center' });
+      this.scrollToLine(el, smooth);
+    }
+    /* Centres a line in the lyrics scroller only (scrollIntoView would also scroll Spotify's
+     * own containers around the page). */
+    scrollToLine(el, smooth) {
+      const port = this.scroller, box = port.getBoundingClientRect(), rect = el.getBoundingClientRect();
+      const top = Math.max(0, Math.round(port.scrollTop + rect.top - box.top - (port.clientHeight - rect.height) / 2));
+      if (smooth) port.scrollTo({ top, behavior: 'smooth' });
+      else port.scrollTop = top;
     }
     follow(smooth) {
       if (this.active < 0) return;
       this.userScrolling = false;
-      this.els[this.active].scrollIntoView({ behavior: smooth ? 'smooth' : 'auto', block: 'center' });
+      this.scrollToLine(this.els[this.active], smooth);
     }
     /* Line-synced lyrics wake up exactly at the next line. Word sync ticks at
      * ~30 fps on a timer rather than rAF: high-refresh monitors (165/180 Hz)
@@ -1178,14 +1361,33 @@
       this.chipsEl = h('div', { class: 'sl-chips' });
       const actions = h('div', { class: 'sl-actions' },
         h('button', { type: 'button', class: 'sl-btn sl-btn-ghost', onclick: () => app.currentTrack && app.engine.setTrack(app.currentTrack, true) }, '重新自动匹配'),
-        h('button', { type: 'button', class: 'sl-btn sl-btn-ghost', onclick: async () => {
-          try { await app.engine.unbind(); toast('已解除绑定并重新匹配'); } catch (e) { toast('解除绑定失败：' + (e.message || e)); }
-        } }, '解除绑定'),
+        h('button', { type: 'button', class: 'sl-btn sl-btn-ghost', onclick: () => this.unbind() }, '解除绑定'),
         h('button', { type: 'button', class: 'sl-btn sl-btn-ghost', onclick: () => this.importFile() }, '导入 LRC'),
         h('button', { type: 'button', class: 'sl-btn sl-btn-ghost', onclick: () => this.exportLrc() }, '复制 LRC'));
       const box = h('div', { class: 'sl-match' }, now, form, this.chipsEl, this.listEl, actions);
       this.renderStatus(); this.renderResults();
       return box;
+    }
+    /* Local binding first; the server copy is only deleted when the user says so. */
+    async unbind() {
+      const engine = this.app.engine;
+      if (!engine.track) return;
+      let remote = false;
+      if (!pureLocal() && Core.spotifyId(engine.track.uri)) {
+        let doc = null;
+        try { doc = await engine.remoteBinding(); } catch (_) { /* unreachable: local only */ }
+        if (doc) {
+          const answer = await confirmDialog({
+            title: '服务器上也有这首歌的歌词',
+            body: ['解除绑定会清除本机的绑定并重新匹配。', '要同时删除服务器上的歌词吗？所有使用这台服务器的设备都会受影响。'],
+            confirm: '同时删除服务器上的', cancel: '只解除本机',
+          });
+          if (answer === null) return;
+          remote = answer;
+        }
+      }
+      try { await engine.unbind({ remote }); toast(remote ? '已解除绑定并删除服务器上的歌词' : '已解除本机绑定并重新匹配'); }
+      catch (e) { toast('解除绑定失败：' + (e.message || e)); }
     }
     renderStatus() {
       if (!this.statusEl) return;
@@ -1266,10 +1468,9 @@
             h('button', { type: 'button', class: 'sl-btn sl-btn-green', onclick: async (event) => {
               const button = event.currentTarget; button.disabled = true;
               try {
-                const result = await this.app.engine.bind(c, lyrics);
-                toast(!result ? '保存失败' : result.offline ? '已保存匹配（纯本地模式，只保存在本机）'
-                  : result.local ? '已绑定到本机（本地文件不保存到服务器）'
-                  : result.error ? `已在本机绑定；上传服务器失败：${result.error}` : '已保存匹配，歌词已上传到服务器');
+                const ok = await this.app.engine.bind(c, lyrics);
+                toast(!ok ? '保存失败' : pureLocal() || !Core.spotifyId(this.app.engine.track && this.app.engine.track.uri) ? '已绑定到本机'
+                  : '已绑定到本机；需要共享时点击播放栏的上传按钮');
                 this.search();
               } catch (e) { toast('保存失败：' + (e.message || e)); button.disabled = false; }
             } }, '使用此歌词'),
@@ -1357,8 +1558,8 @@
       };
       this.serverInput = h('input', { class: 'sl-input sl-input-small', type: 'url', spellcheck: 'false', value: server.url, placeholder: cleanServerUrl(DEFAULT_SERVER), onkeydown: (e) => { if (e.key === 'Enter') saveServer(); } });
       this.tokenInput = h('input', { class: 'sl-input sl-input-small', type: 'password', value: store.setting('server_token') || '', placeholder: '令牌（服务器未设置 API_TOKEN 时留空）', onkeydown: (e) => { if (e.key === 'Enter') saveServer(); } });
-      const offsetRow = (label, value, apply) => h('div', { class: 'sl-setting' },
-        h('span', { class: 'sl-setting-text' }, h('span', null, label), h('small', null, '正值让歌词提前显示')),
+      const offsetRow = (label, value, apply, hint = '正值让歌词提前显示') => h('div', { class: 'sl-setting' },
+        h('span', { class: 'sl-setting-text' }, h('span', null, label), h('small', null, hint)),
         h('div', { class: 'sl-stepper' },
           h('button', { type: 'button', onclick: () => { apply(value - 100); rerender(); } }, svg(ICON.minus)),
           h('span', { onclick: () => { apply(0); rerender(); }, title: '点击归零' }, `${value > 0 ? '+' : ''}${value} ms`),
@@ -1367,7 +1568,7 @@
         h('h3', null, '歌词来源'),
         segmented('preferred_provider', '首选歌词源', [['netease', '网易云音乐'], ['qq', 'QQ 音乐']]),
         toggle('spotify_first', '优先使用 Spotify 歌词'),
-        toggle('prefetch', '后台预加载'),
+        toggle('prefetch', '后台预加载', '提前匹配当前和队列中接下来的两首歌'),
         h('h3', null, '显示'),
         toggle('translation', '显示译文'),
         toggle('word_sync', '逐字高亮'),
@@ -1376,7 +1577,7 @@
         segmented('color_mode', '背景', [['cover', '封面取色'], ['blur', '封面模糊'], ['dark', '深色']]),
         h('h3', null, '时间校准'),
         offsetRow('全局偏移', globalOffset, v => engine.setOffset(v, true)),
-        offsetRow('当前歌曲偏移', trackOffset, v => engine.setOffset(v, false)),
+        offsetRow('当前歌曲偏移', trackOffset, v => engine.setOffset(v, false), local ? undefined : '正值让歌词提前显示 · 上传按钮会随歌词一起上传'),
         h('h3', null, '使用方式与网络'),
         modeRow,
         ...(local ? [] : [h('div', { class: 'sl-setting' }, h('span', { class: 'sl-setting-text' }, h('span', null, '服务器状态'), h('small', { class: serverState.ok ? 'sl-good-text' : serverState.ok === false ? 'sl-error' : '' }, serverLine)),
